@@ -178,9 +178,15 @@ during the November 23–29, 2026 build window.
 
 - **Simulator microphone.** The official simulator may deliver no
   microphone audio, so voice input cannot be fully exercised there. On
-  real G2 hardware the SDK audio path is used. Everywhere, voice has a
+  real G2 hardware the SDK audio path is used: the SDK delivers
+  processed PCM frames, which Glimpse wraps as 16 kHz mono WAV for
+  transcription (the browser fallback resamples its capture to 16 kHz
+  explicitly). Everywhere, voice has a
   fallback: quick replies and AI drafts cover the same reply flow
   without a microphone.
+- **Edits and deletions stay as received.** If a message is edited or
+  deleted in Telegram after the bot received it, the digest still shows
+  the text as it first arrived; Glimpse does not track later edits.
 - **One operator per chat.** A chat's messages are attached to the
   account whose bot membership surfaced them; this is a personal digest,
   not a shared team inbox.
