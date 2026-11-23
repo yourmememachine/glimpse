@@ -6,7 +6,7 @@
 
 **Demo video:** VIDEO_URL_TO_ADD
 
-**Repository:** REPO_URL_TO_ADD
+**Repository:** https://github.com/yourmememachine/glimpse
 
 ## Short description
 
