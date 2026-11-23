@@ -166,16 +166,21 @@ test("pairing code is single-use", async () => {
   assert.equal(second.status, 401);
 });
 
-test("/start re-sends the live code instead of minting a new one", async () => {
+test("/start mints a fresh code each time and only the newest redeems", async () => {
+  // Codes are stored hashed, so a live code cannot be re-sent; each /start
+  // replaces the previous unused code.
   const env = makeEnv();
   await webhook(env.app, dmUpdate("/start", { messageId: 1 }));
   const first = lastCode(env.tg);
   await webhook(env.app, dmUpdate("/start", { messageId: 2 }));
   const second = lastCode(env.tg);
-  assert.equal(second, first);
-  const pairRes = await env.app.fetch(req("/v1/pair", { method: "POST", body: { code: first } }));
+  if (second !== first) {
+    const stale = await env.app.fetch(req("/v1/pair", { method: "POST", body: { code: first } }));
+    assert.equal(stale.status, 401);
+  }
+  const pairRes = await env.app.fetch(req("/v1/pair", { method: "POST", body: { code: second } }));
   assert.equal(pairRes.status, 200);
-  // Once used, the next /start mints a fresh code.
+  // Once used, the next /start mints a fresh code that also redeems.
   await webhook(env.app, dmUpdate("/start", { messageId: 3 }));
   const third = lastCode(env.tg);
   const pair2 = await env.app.fetch(req("/v1/pair", { method: "POST", body: { code: third } }));

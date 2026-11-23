@@ -9,12 +9,23 @@
 //   - Timestamps are integer milliseconds since the epoch.
 //   - redeemPairCode returns the user ({id, firstName}) or null when the code
 //     is unknown, already used, or expired; a successful redeem marks it used.
+//     Pairing codes are never stored in plaintext: only their SHA-256 hash
+//     is kept (pair_codes.code_hash), so a database leak does not expose a
+//     live code. The plaintext exists only in the bot DM sent at mint time.
 //   - A source with a null owner belongs to nobody: it is never listed for
 //     any user. Ownership is only ever set when a caller passes an explicit
 //     owner for a brand-new source or fills a still-null owner; an existing
 //     owner is never overwritten.
 
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+async function sha256Hex(text) {
+  const digest = await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text)
+  );
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 function sourceRow(row) {
   if (!row) return null;
@@ -64,9 +75,10 @@ export class D1Store {
   }
 
   async createPairCode({ code, userId, expiresAt }) {
+    const codeHash = await sha256Hex(code);
     const existing = await this.db
-      .prepare(`SELECT code, user_id, used FROM pair_codes WHERE code = ?`)
-      .bind(code)
+      .prepare(`SELECT code_hash, user_id, used FROM pair_codes WHERE code_hash = ?`)
+      .bind(codeHash)
       .first();
     if (existing && existing.user_id !== userId && !existing.used) {
       return false;
@@ -77,33 +89,34 @@ export class D1Store {
       .run();
     await this.db
       .prepare(
-        `INSERT OR REPLACE INTO pair_codes (code, user_id, expires_at, used) VALUES (?, ?, ?, 0)`
+        `INSERT OR REPLACE INTO pair_codes (code_hash, user_id, expires_at, used) VALUES (?, ?, ?, 0)`
       )
-      .bind(code, userId, expiresAt)
+      .bind(codeHash, userId, expiresAt)
       .run();
     return true;
   }
 
-  async getLivePairCode(userId, nowMs) {
+  async hasLivePairCode(userId, nowMs) {
     const row = await this.db
       .prepare(
-        `SELECT code FROM pair_codes WHERE user_id = ? AND used = 0 AND expires_at > ?
+        `SELECT code_hash FROM pair_codes WHERE user_id = ? AND used = 0 AND expires_at > ?
          ORDER BY expires_at DESC LIMIT 1`
       )
       .bind(userId, nowMs)
       .first();
-    return row ? row.code : null;
+    return Boolean(row);
   }
 
   async redeemPairCode(code, nowMs) {
+    const codeHash = await sha256Hex(code);
     const row = await this.db
-      .prepare(`SELECT code, user_id, expires_at, used FROM pair_codes WHERE code = ?`)
-      .bind(code)
+      .prepare(`SELECT code_hash, user_id, expires_at, used FROM pair_codes WHERE code_hash = ?`)
+      .bind(codeHash)
       .first();
     if (!row || row.used || row.expires_at <= nowMs) return null;
     const claim = await this.db
-      .prepare(`UPDATE pair_codes SET used = 1 WHERE code = ? AND used = 0`)
-      .bind(code)
+      .prepare(`UPDATE pair_codes SET used = 1 WHERE code_hash = ? AND used = 0`)
+      .bind(codeHash)
       .run();
     if (!claim?.meta?.changes) return null;
     const user = await this.db
@@ -114,18 +127,29 @@ export class D1Store {
     return { id: user.telegram_id, firstName: user.first_name };
   }
 
-  async recordPairFailure(at) {
+  async recordPairFailure(at, client, pruneBeforeMs) {
+    if (pruneBeforeMs != null) {
+      await this.db
+        .prepare(`DELETE FROM pair_failures WHERE at <= ?`)
+        .bind(pruneBeforeMs)
+        .run();
+    }
     await this.db
-      .prepare(`INSERT INTO pair_failures (at) VALUES (?)`)
-      .bind(at)
+      .prepare(`INSERT INTO pair_failures (at, client) VALUES (?, ?)`)
+      .bind(at, client ?? null)
       .run();
   }
 
-  async pairFailuresInWindow(nowMs, windowMs) {
-    const row = await this.db
-      .prepare(`SELECT COUNT(*) AS n FROM pair_failures WHERE at > ?`)
-      .bind(nowMs - windowMs)
-      .first();
+  async pairFailuresInWindow(nowMs, windowMs, client = null) {
+    const sql =
+      client == null
+        ? `SELECT COUNT(*) AS n FROM pair_failures WHERE at > ?`
+        : `SELECT COUNT(*) AS n FROM pair_failures WHERE at > ? AND client = ?`;
+    const stmt = this.db.prepare(sql);
+    const row = await (client == null
+      ? stmt.bind(nowMs - windowMs)
+      : stmt.bind(nowMs - windowMs, client)
+    ).first();
     return row ? Number(row.n) : 0;
   }
 
@@ -203,26 +227,33 @@ export class D1Store {
       .all();
     const out = [];
     for (const s of sources) {
-      const { results: msgs } = await this.db
-        .prepare(`SELECT * FROM messages WHERE source_id = ? ORDER BY at DESC, id DESC`)
-        .bind(s.chat_id)
-        .all();
-      if (!msgs.length) continue;
       const marker = await this.db
         .prepare(`SELECT last_read_id FROM read_markers WHERE user_id = ? AND source_id = ?`)
         .bind(userId, s.chat_id)
         .first();
       const lastRead = marker ? marker.last_read_id : 0;
-      const unread = msgs.filter((m) => m.id > lastRead).length;
+      // Unread is a SQL COUNT over the marker, and the digest preview is a
+      // LIMIT 3 query — the full message history is never loaded.
+      const countRow = await this.db
+        .prepare(`SELECT COUNT(*) AS n FROM messages WHERE source_id = ? AND id > ?`)
+        .bind(s.chat_id, lastRead)
+        .first();
+      const { results: newest } = await this.db
+        .prepare(
+          `SELECT text, at FROM messages WHERE source_id = ? ORDER BY at DESC, id DESC LIMIT 3`
+        )
+        .bind(s.chat_id)
+        .all();
+      if (!newest.length) continue;
       out.push({
         id: s.chat_id,
         chatId: s.chat_id,
         userId: s.user_id,
         type: s.type,
         title: s.title,
-        unread,
-        lastAt: msgs[0].at,
-        topTexts: msgs.slice(0, 3).map((m) => m.text),
+        unread: countRow ? Number(countRow.n) : 0,
+        lastAt: newest[0].at,
+        topTexts: newest.map((m) => m.text),
       });
     }
     out.sort((a, b) => b.lastAt - a.lastAt);
@@ -314,29 +345,29 @@ export class MemoryStore {
   }
 
   async createPairCode({ code, userId, expiresAt }) {
-    const existing = this.pairCodes.get(code);
+    const codeHash = await sha256Hex(code);
+    const existing = this.pairCodes.get(codeHash);
     if (existing && existing.userId !== userId && !existing.used) {
       return false;
     }
     for (const [key, entry] of this.pairCodes) {
       if (entry.userId === userId && !entry.used) this.pairCodes.delete(key);
     }
-    this.pairCodes.set(code, { code, userId, expiresAt, used: false });
+    this.pairCodes.set(codeHash, { userId, expiresAt, used: false });
     return true;
   }
 
-  async getLivePairCode(userId, nowMs) {
-    let best = null;
+  async hasLivePairCode(userId, nowMs) {
     for (const entry of this.pairCodes.values()) {
       if (entry.userId !== userId || entry.used) continue;
-      if (entry.expiresAt <= nowMs) continue;
-      if (!best || entry.expiresAt > best.expiresAt) best = entry;
+      if (entry.expiresAt > nowMs) return true;
     }
-    return best ? best.code : null;
+    return false;
   }
 
   async redeemPairCode(code, nowMs) {
-    const entry = this.pairCodes.get(code);
+    const codeHash = await sha256Hex(code);
+    const entry = this.pairCodes.get(codeHash);
     if (!entry || entry.used || entry.expiresAt <= nowMs) return null;
     entry.used = true;
     const user = this.users.get(entry.userId);
@@ -344,13 +375,18 @@ export class MemoryStore {
     return { id: user.id, firstName: user.firstName };
   }
 
-  async recordPairFailure(at) {
-    this.pairFailures.push(at);
+  async recordPairFailure(at, client, pruneBeforeMs) {
+    if (pruneBeforeMs != null) {
+      this.pairFailures = this.pairFailures.filter((f) => f.at > pruneBeforeMs);
+    }
+    this.pairFailures.push({ at, client: client ?? null });
   }
 
-  async pairFailuresInWindow(nowMs, windowMs) {
+  async pairFailuresInWindow(nowMs, windowMs, client = null) {
     const cutoff = nowMs - windowMs;
-    return this.pairFailures.filter((at) => at > cutoff).length;
+    return this.pairFailures.filter(
+      (f) => f.at > cutoff && (client == null || f.client === client)
+    ).length;
   }
 
   async createSession(tokenHash, userId, createdAt) {
@@ -424,10 +460,18 @@ export class MemoryStore {
     const out = [];
     for (const s of this.sources.values()) {
       if (s.userId !== userId) continue;
-      const msgs = this.messages.filter((m) => m.sourceId === s.chatId).sort(byNewest);
-      if (!msgs.length) continue;
       const lastRead = this.readMarkers.get(`${userId}:${s.chatId}`) ?? 0;
-      const unread = msgs.filter((m) => m.id > lastRead).length;
+      // Single pass: count unread and keep references to the three newest
+      // messages instead of copying and sorting the source's whole history.
+      let unread = 0;
+      const newest = [];
+      for (const m of this.messages) {
+        if (m.sourceId !== s.chatId) continue;
+        if (m.id > lastRead) unread++;
+        newest.push(m);
+      }
+      if (!newest.length) continue;
+      newest.sort(byNewest);
       out.push({
         id: s.chatId,
         chatId: s.chatId,
@@ -435,8 +479,8 @@ export class MemoryStore {
         type: s.type,
         title: s.title,
         unread,
-        lastAt: msgs[0].at,
-        topTexts: msgs.slice(0, 3).map((m) => m.text),
+        lastAt: newest[0].at,
+        topTexts: newest.slice(0, 3).map((m) => m.text),
       });
     }
     out.sort((a, b) => b.lastAt - a.lastAt);

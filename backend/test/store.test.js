@@ -70,3 +70,44 @@ test("sessions resolve back to their user", async () => {
   assert.deepEqual(await store.userForToken("deadbeef"), { id: 7, firstName: "Jo" });
   assert.equal(await store.userForToken("missing"), null);
 });
+
+test("pair codes are stored only as hashes, never in plaintext", async () => {
+  const store = new MemoryStore();
+  await store.upsertUser(7, "Jo", 1000);
+  await store.createPairCode({ code: "123456", userId: 7, expiresAt: 5000 });
+  const keys = [...store.pairCodes.keys()];
+  assert.equal(keys.length, 1);
+  assert.ok(!keys.includes("123456"), "plaintext code must not be a storage key");
+  assert.match(keys[0], /^[0-9a-f]{64}$/);
+  // Redemption with the plaintext code still works end to end.
+  assert.deepEqual(await store.redeemPairCode("123456", 2000), { id: 7, firstName: "Jo" });
+});
+
+test("two concurrent redeems of the same code succeed exactly once", async () => {
+  const store = new MemoryStore();
+  await store.upsertUser(7, "Jo", 1000);
+  await store.createPairCode({ code: "246810", userId: 7, expiresAt: 5000 });
+  const results = await Promise.all([
+    store.redeemPairCode("246810", 2000),
+    store.redeemPairCode("246810", 2000),
+  ]);
+  assert.equal(results.filter((r) => r !== null).length, 1);
+  assert.deepEqual(results.find((r) => r !== null), { id: 7, firstName: "Jo" });
+});
+
+test("pair failures are counted per client and expired rows are pruned on write", async () => {
+  const store = new MemoryStore();
+  const t0 = 1_000_000;
+  await store.recordPairFailure(t0, "ip:203.0.113.9", t0 - 600_000);
+  await store.recordPairFailure(t0 + 1000, "ip:198.51.100.7", t0 - 600_000);
+  assert.equal(await store.pairFailuresInWindow(t0 + 2000, 600_000, "ip:203.0.113.9"), 1);
+  assert.equal(await store.pairFailuresInWindow(t0 + 2000, 600_000, "ip:198.51.100.7"), 1);
+  assert.equal(await store.pairFailuresInWindow(t0 + 2000, 600_000), 2);
+  // A write 20 minutes later prunes everything at or before its cutoff,
+  // even rows a wider query window would still have counted.
+  const t1 = t0 + 20 * 60_000;
+  await store.recordPairFailure(t1, "ip:203.0.113.9", t1 - 600_000);
+  assert.equal(store.pairFailures.length, 1);
+  assert.equal(await store.pairFailuresInWindow(t1, 60 * 60_000, "ip:203.0.113.9"), 1);
+  assert.equal(await store.pairFailuresInWindow(t1, 60 * 60_000), 1);
+});

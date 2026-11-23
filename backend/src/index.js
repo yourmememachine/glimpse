@@ -4,7 +4,11 @@ import { createAi, cleanDraft } from "./ai.js";
 
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000;
 const PAIR_FAILURE_WINDOW_MS = 10 * 60 * 1000;
-const PAIR_FAILURE_LIMIT = 10;
+// Failed pairing attempts are limited per client identity, so one attacker
+// burning their own budget cannot lock anyone else out. A much higher
+// global backstop still bounds the total guessing rate across many clients.
+const PAIR_FAILURE_LIMIT_PER_CLIENT = 10;
+const PAIR_FAILURE_LIMIT_GLOBAL = 100;
 const STT_MAX_BYTES = 2 * 1024 * 1024;
 const JSON_MAX_BYTES = 64 * 1024;
 const DIGEST_LINE_BUDGET = 52;
@@ -111,6 +115,15 @@ function isStartCommand(text) {
   return text === "/start" || text.startsWith("/start ");
 }
 
+// True only when Telegram's error says the reply target itself is the
+// problem (the message being answered is gone). Rate limits, network
+// errors and everything else must surface as failures, not silently
+// degrade to an unthreaded send.
+function isReplyTargetError(err) {
+  const text = `${err?.description ?? ""} ${err?.message ?? ""}`;
+  return /message to be replied not found/i.test(text);
+}
+
 async function readJson(req) {
   try {
     return await req.json();
@@ -121,6 +134,10 @@ async function readJson(req) {
 
 export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
   const nowMs = typeof now === "function" ? now : () => Date.now();
+  // Identical sends already in flight, keyed like the send-dedupe window
+  // (user, source, text): a concurrent duplicate awaits the first send
+  // instead of posting twice.
+  const inFlightSends = new Map();
 
   async function authenticate(req) {
     const header = req.headers.get("authorization") ?? "";
@@ -130,29 +147,50 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
     return store.userForToken(tokenHash, nowMs());
   }
 
-  async function pairLockedOut() {
-    if (typeof store.pairFailuresInWindow !== "function") return false;
-    const count = await store.pairFailuresInWindow(nowMs(), PAIR_FAILURE_WINDOW_MS);
-    return count >= PAIR_FAILURE_LIMIT;
+  function clientKeyFor(req) {
+    const cfIp = req.headers.get("cf-connecting-ip");
+    if (cfIp && cfIp.trim()) return `ip:${cfIp.trim()}`;
+    const forwarded = req.headers.get("x-forwarded-for");
+    if (forwarded && forwarded.trim()) return `ip:${forwarded.split(",")[0].trim()}`;
+    return "ip:unknown";
   }
 
-  async function notePairFailure() {
+  async function pairLockedOut(clientKey) {
+    if (typeof store.pairFailuresInWindow !== "function") return false;
+    const perClient = await store.pairFailuresInWindow(
+      nowMs(),
+      PAIR_FAILURE_WINDOW_MS,
+      clientKey
+    );
+    if (perClient >= PAIR_FAILURE_LIMIT_PER_CLIENT) return true;
+    const global = await store.pairFailuresInWindow(nowMs(), PAIR_FAILURE_WINDOW_MS);
+    return global >= PAIR_FAILURE_LIMIT_GLOBAL;
+  }
+
+  async function notePairFailure(clientKey) {
     if (typeof store.recordPairFailure === "function") {
-      await store.recordPairFailure(nowMs());
+      // The prune cutoff travels with the write so expired failure records
+      // are deleted as new ones arrive and the table stays bounded.
+      await store.recordPairFailure(
+        nowMs(),
+        clientKey,
+        nowMs() - PAIR_FAILURE_WINDOW_MS
+      );
     }
   }
 
   async function handlePair(req) {
-    if (await pairLockedOut()) return error(429, "too_many_attempts");
+    const clientKey = clientKeyFor(req);
+    if (await pairLockedOut(clientKey)) return error(429, "too_many_attempts");
     const body = await readJson(req);
     const code = body?.code != null ? String(body.code).trim() : "";
     if (!/^\d{6}$/.test(code)) {
-      await notePairFailure();
+      await notePairFailure(clientKey);
       return error(401, "invalid_code");
     }
     const user = await store.redeemPairCode(code, nowMs());
     if (!user) {
-      await notePairFailure();
+      await notePairFailure(clientKey);
       return error(401, "invalid_code");
     }
     const token = randomTokenHex();
@@ -249,33 +287,57 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
       }
     }
 
-    let result;
-    try {
-      result = await tg.sendMessage(source.chatId ?? source.id, text, {
-        replyToMessageId: replyToTgId,
-      });
-    } catch {
-      if (replyToTgId == null) return error(502, "send_failed");
+    const sendOnce = async () => {
+      let result;
       try {
+        result = await tg.sendMessage(source.chatId ?? source.id, text, {
+          replyToMessageId: replyToTgId,
+        });
+      } catch (err) {
+        if (replyToTgId == null || !isReplyTargetError(err)) throw err;
+        // Only a missing reply target earns the unthreaded retry; any
+        // other failure (rate limit, network, permissions) propagates.
         result = await tg.sendMessage(source.chatId ?? source.id, text, {});
+      }
+      const messageId =
+        typeof result === "number"
+          ? result
+          : result?.message_id ?? result?.messageId ?? null;
+      if (typeof store.recordSend === "function" && messageId != null) {
+        await store.recordSend({
+          userId: user.id,
+          sourceId,
+          text,
+          messageId,
+          at: nowMs(),
+        });
+      }
+      return messageId;
+    };
+
+    // No await between the map lookup and the set, so two concurrent
+    // identical sends cannot both slip through: the second awaits the
+    // first one's outcome and reports as deduped.
+    const flightKey = `${user.id}:${sourceId}:${text}`;
+    const inFlight = inFlightSends.get(flightKey);
+    if (inFlight) {
+      try {
+        const messageId = await inFlight;
+        return json({ ok: true, messageId, deduped: true });
       } catch {
         return error(502, "send_failed");
       }
     }
-    const messageId =
-      typeof result === "number"
-        ? result
-        : result?.message_id ?? result?.messageId ?? null;
-    if (typeof store.recordSend === "function" && messageId != null) {
-      await store.recordSend({
-        userId: user.id,
-        sourceId,
-        text,
-        messageId,
-        at: nowMs(),
-      });
+    const flight = sendOnce();
+    inFlightSends.set(flightKey, flight);
+    try {
+      const messageId = await flight;
+      return json({ ok: true, messageId });
+    } catch {
+      return error(502, "send_failed");
+    } finally {
+      inFlightSends.delete(flightKey);
     }
-    return json({ ok: true, messageId });
   }
 
   async function handleDraft(req) {
@@ -330,10 +392,10 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
   }
 
   async function issuePairCode(sender, chatId) {
-    if (typeof store.getLivePairCode === "function") {
-      const live = await store.getLivePairCode(sender.id, nowMs());
-      if (live) return live;
-    }
+    // Codes are stored only as hashes, so a still-live code cannot be
+    // re-sent — its plaintext exists nowhere after the first DM. Every
+    // /start therefore mints a fresh code; minting replaces the user's
+    // previous unused code, so only the newest DM's code redeems.
     for (let attempt = 0; attempt < 10; attempt++) {
       const code = randomPairCode();
       const created = await store.createPairCode({
@@ -456,7 +518,13 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
         }
       }
     } catch (err) {
+      // A processing failure (e.g. the store is briefly unavailable) must
+      // NOT be acknowledged: a non-2xx answer makes Telegram redeliver the
+      // update. Ingestion is idempotent, so redelivery cannot duplicate a
+      // stored message. Ignorable updates (unparseable body, update types
+      // we do not handle) still fall through to the 200 below.
       console.error("webhook handler failed", err?.message ?? "unknown");
+      return error(500, "webhook_failed");
     }
     return json({ ok: true });
   }

@@ -34,8 +34,8 @@ of the app keeps working.
 
 **Telegram integration.** The bot receives updates over a webhook: it
 ingests group messages from groups it is a member of, channel posts
-from channels where it is an administrator with Post Messages
-permission, and anything forwarded to the bot's DM, which becomes the
+from channels where it is an administrator (the Post Messages
+permission is what lets it post replies into a channel), and anything forwarded to the bot's DM, which becomes the
 forwarded-items inbox. Replies sent from the glasses are threaded to
 the message they answer using `reply_to_message_id`. Pairing happens
 through the bot's `/start` DM: the bot replies with a 6-digit code,

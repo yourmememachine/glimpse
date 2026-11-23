@@ -16,14 +16,21 @@ export function createTelegram({ token, fetchImpl } = {}) {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) throw new Error(`telegram_send_failed:${res.status}`);
     let data = null;
     try {
       data = await res.json();
     } catch {
       data = null;
     }
-    if (data && data.ok === false) throw new Error("telegram_send_failed");
+    if (!res.ok || (data && data.ok === false)) {
+      // Keep Telegram's description on the error: callers distinguish a
+      // reply-target problem ("message to be replied not found") from
+      // rate limits and other failures by it.
+      const err = new Error(`telegram_send_failed:${res.status}`);
+      err.status = res.status;
+      err.description = data?.description ?? null;
+      throw err;
+    }
     return data?.result ?? data;
   }
 

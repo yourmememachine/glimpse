@@ -231,13 +231,17 @@ test("reply translates the internal id to the telegram message id", async () => 
   assert.equal(bad.status, 400);
 });
 
-test("reply retries once without the target when the targeted send fails", async () => {
+test("reply retries once without the target when telegram says the reply target is gone", async () => {
   const calls = [];
   const tg = {
     sent: calls,
     async sendMessage(chatId, text, opts) {
       calls.push({ chatId, text, opts });
-      if (opts && opts.replyToMessageId != null) throw new Error("target gone");
+      if (opts && opts.replyToMessageId != null) {
+        const err = new Error("telegram_send_failed:400");
+        err.description = "Bad Request: message to be replied not found";
+        throw err;
+      }
       return { message_id: 555 };
     },
   };
@@ -458,4 +462,122 @@ test("anonymous admin posts prefer the sender chat name", async () => {
   await webhook(env.app, update);
   const msgs = await env.store.messagesFor(GROUP_ID, 20);
   assert.equal(msgs[0].from, "Team Chat");
+});
+
+test("reply does not fall back unthreaded on a rate-limit error", async () => {
+  const calls = [];
+  const tg = {
+    sent: calls,
+    async sendMessage(chatId, text, opts) {
+      calls.push({ chatId, text, opts });
+      if (opts && opts.replyToMessageId != null) {
+        const err = new Error("telegram_send_failed:429");
+        err.description = "Too Many Requests: retry after 3";
+        throw err;
+      }
+      return { message_id: 556 };
+    },
+  };
+  const env = makeEnv({ tgImpl: tg });
+  const token = await pairToken(env);
+  await webhook(env.app, memberUpdate());
+  await webhook(env.app, groupUpdate("target", { messageId: 777, date: 1_700_000_100 }));
+  const srcRes = await env.app.fetch(req(`/v1/source/${GROUP_ID}`, { token }));
+  const { messages } = await srcRes.json();
+
+  const before = calls.length;
+  const res = await env.app.fetch(
+    req("/v1/reply", {
+      method: "POST",
+      token,
+      body: { sourceId: GROUP_ID, text: "rate limited", replyToMessageId: messages[0].id },
+    })
+  );
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error, "send_failed");
+  // Exactly one send attempt: no silent unthreaded retry went out.
+  assert.equal(calls.length, before + 1);
+  assert.equal(calls[before].opts.replyToMessageId, 777);
+});
+
+test("pair lockout is per client: one attacker cannot lock out another client", async () => {
+  const env = makeEnv();
+  await webhook(env.app, dmUpdate("/start"));
+  const good = lastCode(env.tg);
+  const wrong = good === "000000" ? "000001" : "000000";
+  const attacker = { "cf-connecting-ip": "203.0.113.9" };
+  const victim = { "cf-connecting-ip": "198.51.100.7" };
+  for (let i = 0; i < 10; i++) {
+    const res = await env.app.fetch(
+      req("/v1/pair", { method: "POST", body: { code: wrong }, headers: attacker })
+    );
+    assert.equal(res.status, 401, `attacker failure ${i + 1}`);
+  }
+  // The attacker is locked out, even with the genuine code.
+  const locked = await env.app.fetch(
+    req("/v1/pair", { method: "POST", body: { code: good }, headers: attacker })
+  );
+  assert.equal(locked.status, 429);
+  // A different client is unaffected and pairs with the same code.
+  const ok = await env.app.fetch(
+    req("/v1/pair", { method: "POST", body: { code: good }, headers: victim })
+  );
+  assert.equal(ok.status, 200);
+  assert.ok((await ok.json()).token);
+});
+
+test("webhook answers non-200 on a store failure and the redelivery is stored once", async () => {
+  const env = makeEnv();
+  await webhook(env.app, memberUpdate());
+  const update = groupUpdate("important", { messageId: 31, date: 1_700_000_100 });
+
+  const original = env.store.addMessage.bind(env.store);
+  env.store.addMessage = async () => {
+    throw new Error("store unavailable");
+  };
+  const failed = await webhook(env.app, update);
+  assert.notEqual(failed.status, 200);
+  assert.equal(failed.status, 500);
+  assert.deepEqual(await env.store.messagesFor(GROUP_ID, 20), []);
+
+  // Telegram redelivers the same update; it is stored exactly once, and a
+  // further duplicate delivery still stores nothing new.
+  env.store.addMessage = original;
+  const retry = await webhook(env.app, update);
+  assert.equal(retry.status, 200);
+  const again = await webhook(env.app, update);
+  assert.equal(again.status, 200);
+  const msgs = await env.store.messagesFor(GROUP_ID, 20);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].text, "important");
+});
+
+test("two simultaneous identical replies produce a single send", async () => {
+  const calls = [];
+  const tg = {
+    sent: calls,
+    async sendMessage(chatId, text, opts) {
+      calls.push({ chatId, text, opts });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { message_id: 900 };
+    },
+  };
+  const env = makeEnv({ tgImpl: tg });
+  const token = await pairToken(env);
+  await webhook(env.app, memberUpdate());
+  await webhook(env.app, groupUpdate("ping", { messageId: 1, date: 1_700_000_100 }));
+  const groupSends = () => calls.filter((m) => m.chatId === GROUP_ID).length;
+  const before = groupSends();
+
+  const send = () =>
+    env.app.fetch(
+      req("/v1/reply", { method: "POST", token, body: { sourceId: GROUP_ID, text: "same words" } })
+    );
+  const [r1, r2] = await Promise.all([send(), send()]);
+  assert.equal(r1.status, 200);
+  assert.equal(r2.status, 200);
+  const bodies = [await r1.json(), await r2.json()];
+  assert.equal(groupSends(), before + 1);
+  assert.ok(bodies.every((b) => b.ok && b.messageId === 900));
+  assert.equal(bodies.filter((b) => b.deduped === true).length, 1);
 });

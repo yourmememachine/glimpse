@@ -77,10 +77,13 @@ accept as-is, or a short voice note that is transcribed and sent as text.
    to, any group it already belongs to before it will see that group's
    ordinary messages.
 3. Add the bot to the groups and channels you want in your digest. For
-   a **channel**, the bot must be added as a channel **administrator**
-   with the **Post Messages** permission — a channel the bot is merely
-   subscribed to sends it nothing, so no channel posts are received
-   until it is an admin there.
+   a **channel**, the bot must be added as a channel **administrator** —
+   administrator status alone is what makes Telegram send the bot the
+   channel's posts; a channel the bot is merely subscribed to sends it
+   nothing. Replies you send from the glasses are posted into the channel
+   by the bot, and posting needs the administrator **Post Messages**
+   permission — grant it if you want to reply to channel posts from the
+   glasses; receiving posts does not require it.
 
 ### 2. Deploy the Worker backend
 

@@ -31,6 +31,25 @@ test("telegram sendMessage throws on a failed response", async () => {
   await assert.rejects(() => tg.sendMessage(1, "hi"));
 });
 
+test("telegram sendMessage errors carry the telegram description", async () => {
+  const tg = createTelegram({
+    token: "TOK",
+    fetchImpl: async () =>
+      jsonResponse(
+        { ok: false, description: "Bad Request: message to be replied not found" },
+        { ok: false, status: 400 }
+      ),
+  });
+  await assert.rejects(
+    () => tg.sendMessage(1, "hi", { replyToMessageId: 5 }),
+    (err) => {
+      assert.equal(err.status, 400);
+      assert.equal(err.description, "Bad Request: message to be replied not found");
+      return true;
+    }
+  );
+});
+
 test("draft returns null without a key and never calls out", async () => {
   let called = false;
   const ai = createAi({

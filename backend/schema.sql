@@ -4,8 +4,10 @@ CREATE TABLE IF NOT EXISTS users (
   created_at INTEGER
 );
 
+-- Only the SHA-256 hash of a pairing code is stored, never the code itself;
+-- the plaintext code exists only in the bot DM sent to the user at mint time.
 CREATE TABLE IF NOT EXISTS pair_codes (
-  code TEXT PRIMARY KEY,
+  code_hash TEXT PRIMARY KEY,
   user_id INTEGER,
   expires_at INTEGER,
   used INTEGER
@@ -35,8 +37,12 @@ CREATE TABLE IF NOT EXISTS messages (
   UNIQUE(source_id, tg_message_id)
 );
 
+-- One row per failed pairing attempt, keyed by client identity so one
+-- attacker cannot exhaust the limit for everyone; rows older than the
+-- failure window are pruned on each new failure.
 CREATE TABLE IF NOT EXISTS pair_failures (
-  at INTEGER
+  at INTEGER,
+  client TEXT
 );
 
 CREATE TABLE IF NOT EXISTS recent_sends (
