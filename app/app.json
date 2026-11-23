@@ -1,0 +1,1 @@
+{"edition":"202601","entrypoint":"index.html","min_sdk_version":"0.0.16","name":"Glimpse","package_id":"com.dilip.glimpse","permissions":[{"name":"network","whitelist":["https://glimpse-backend.example.workers.dev"]},{"name":"g2-microphone"},{"name":"phone-microphone"}],"supported_languages":["en"],"version":"0.1.0"}

@@ -1,0 +1,1 @@
+{"description":"Glimpse — a Telegram digest and reply app for Even Realities G2 smart glasses.","license":"MIT","name":"glimpse","private":true,"scripts":{"seed-demo":"node tools/seed-demo.mjs","test":"node tools/run-tests.mjs"},"type":"module","version":"0.1.0"}

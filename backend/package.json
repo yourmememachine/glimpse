@@ -1,0 +1,1 @@
+{"name":"glimpse-backend","private":true,"scripts":{"test":"node --test"},"type":"module","version":"1.0.0"}
