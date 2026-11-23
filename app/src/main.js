@@ -9,7 +9,7 @@ let machine = null;
 async function boot() {
   runtime = await connectRuntime({
     onGesture: (g) => dispatch(g),
-    onNoFrames: () => machine?.noFrames(),
+    onNoFrames: () => { machine?.noFrames(); render(); },
   });
   const api = createApi({ storage: runtime.storage });
   machine = createScreenMachine({
@@ -24,7 +24,7 @@ async function boot() {
   await runtime.init();
   await machine.init();
   render();
-  setInterval(() => { machine?.checkRecordingTimeout(); }, 500);
+  setInterval(() => { machine?.checkRecordingTimeout(); render(); }, 500);
 
   const pairBtn = document.getElementById('pair-btn');
   if (pairBtn) {
