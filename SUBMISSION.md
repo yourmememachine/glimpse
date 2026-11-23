@@ -4,7 +4,7 @@
 
 **Track:** Track 01 · Messaging & News
 
-**Demo video:** VIDEO_URL_TO_ADD
+**Demo video:** https://youtu.be/ftnYzlltlsA
 
 **Repository:** https://github.com/yourmememachine/glimpse
 
