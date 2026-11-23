@@ -9,6 +9,12 @@
 //   - Timestamps are integer milliseconds since the epoch.
 //   - redeemPairCode returns the user ({id, firstName}) or null when the code
 //     is unknown, already used, or expired; a successful redeem marks it used.
+//   - A source with a null owner belongs to nobody: it is never listed for
+//     any user. Ownership is only ever set when a caller passes an explicit
+//     owner for a brand-new source or fills a still-null owner; an existing
+//     owner is never overwritten.
+
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 function sourceRow(row) {
   if (!row) return null;
@@ -28,6 +34,7 @@ function messageRow(row) {
     id: row.id,
     sourceId: row.source_id,
     tgMessageId: row.tg_message_id,
+    tg_message_id: row.tg_message_id,
     from: row.from_name,
     text: row.text,
     at: row.at,
@@ -48,7 +55,8 @@ export class D1Store {
     await this.db
       .prepare(
         `INSERT INTO users (telegram_id, first_name, created_at) VALUES (?, ?, ?)
-         ON CONFLICT(telegram_id) DO UPDATE SET first_name = excluded.first_name`
+         ON CONFLICT(telegram_id) DO UPDATE SET
+           first_name = COALESCE(excluded.first_name, users.first_name)`
       )
       .bind(telegramId, firstName ?? null, createdAt)
       .run();
@@ -56,6 +64,13 @@ export class D1Store {
   }
 
   async createPairCode({ code, userId, expiresAt }) {
+    const existing = await this.db
+      .prepare(`SELECT code, user_id, used FROM pair_codes WHERE code = ?`)
+      .bind(code)
+      .first();
+    if (existing && existing.user_id !== userId && !existing.used) {
+      return false;
+    }
     await this.db
       .prepare(`DELETE FROM pair_codes WHERE user_id = ? AND used = 0`)
       .bind(userId)
@@ -66,6 +81,18 @@ export class D1Store {
       )
       .bind(code, userId, expiresAt)
       .run();
+    return true;
+  }
+
+  async getLivePairCode(userId, nowMs) {
+    const row = await this.db
+      .prepare(
+        `SELECT code FROM pair_codes WHERE user_id = ? AND used = 0 AND expires_at > ?
+         ORDER BY expires_at DESC LIMIT 1`
+      )
+      .bind(userId, nowMs)
+      .first();
+    return row ? row.code : null;
   }
 
   async redeemPairCode(code, nowMs) {
@@ -87,6 +114,21 @@ export class D1Store {
     return { id: user.telegram_id, firstName: user.first_name };
   }
 
+  async recordPairFailure(at) {
+    await this.db
+      .prepare(`INSERT INTO pair_failures (at) VALUES (?)`)
+      .bind(at)
+      .run();
+  }
+
+  async pairFailuresInWindow(nowMs, windowMs) {
+    const row = await this.db
+      .prepare(`SELECT COUNT(*) AS n FROM pair_failures WHERE at > ?`)
+      .bind(nowMs - windowMs)
+      .first();
+    return row ? Number(row.n) : 0;
+  }
+
   async createSession(tokenHash, userId, createdAt) {
     await this.db
       .prepare(`INSERT INTO sessions (token_hash, user_id, created_at) VALUES (?, ?, ?)`)
@@ -94,15 +136,17 @@ export class D1Store {
       .run();
   }
 
-  async userForToken(tokenHash) {
-    const row = await this.db
-      .prepare(
-        `SELECT u.telegram_id AS telegram_id, u.first_name AS first_name
-         FROM sessions s JOIN users u ON u.telegram_id = s.user_id
-         WHERE s.token_hash = ?`
-      )
-      .bind(tokenHash)
-      .first();
+  async userForToken(tokenHash, nowMs) {
+    let sql = `SELECT u.telegram_id AS telegram_id, u.first_name AS first_name
+               FROM sessions s JOIN users u ON u.telegram_id = s.user_id
+               WHERE s.token_hash = ?`;
+    const binds = [tokenHash];
+    if (nowMs != null) {
+      sql += ` AND s.created_at > ?`;
+      binds.push(nowMs - SESSION_TTL_MS);
+    }
+    const stmt = this.db.prepare(sql);
+    const row = await (binds.length > 1 ? stmt.bind(...binds) : stmt.bind(binds[0])).first();
     if (!row) return null;
     return { id: row.telegram_id, firstName: row.first_name };
   }
@@ -112,13 +156,28 @@ export class D1Store {
       .prepare(
         `INSERT INTO sources (chat_id, user_id, type, title, created_at) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(chat_id) DO UPDATE SET
-           title = excluded.title,
-           type = excluded.type,
+           title = COALESCE(excluded.title, sources.title),
+           type = COALESCE(excluded.type, sources.type),
            user_id = COALESCE(sources.user_id, excluded.user_id)`
       )
-      .bind(chatId, userId ?? null, type, title ?? null, createdAt)
+      .bind(chatId, userId ?? null, type ?? null, title ?? null, createdAt)
       .run();
     return this.getSource(chatId);
+  }
+
+  async deleteSource(sourceId) {
+    await this.db
+      .prepare(`DELETE FROM messages WHERE source_id = ?`)
+      .bind(sourceId)
+      .run();
+    await this.db
+      .prepare(`DELETE FROM read_markers WHERE source_id = ?`)
+      .bind(sourceId)
+      .run();
+    await this.db
+      .prepare(`DELETE FROM sources WHERE chat_id = ?`)
+      .bind(sourceId)
+      .run();
   }
 
   async addMessage({ sourceId, tgMessageId, fromName, text, at }) {
@@ -139,7 +198,7 @@ export class D1Store {
 
   async listSourcesWithUnread(userId) {
     const { results: sources } = await this.db
-      .prepare(`SELECT * FROM sources WHERE user_id = ? OR user_id IS NULL`)
+      .prepare(`SELECT * FROM sources WHERE user_id = ?`)
       .bind(userId)
       .all();
     const out = [];
@@ -204,6 +263,29 @@ export class D1Store {
       .first();
     return messageRow(row);
   }
+
+  async findRecentSend({ userId, sourceId, text, sinceMs }) {
+    const row = await this.db
+      .prepare(
+        `SELECT message_id FROM recent_sends
+         WHERE user_id = ? AND source_id = ? AND text = ? AND at > ?
+         ORDER BY at DESC LIMIT 1`
+      )
+      .bind(userId, sourceId, text, sinceMs)
+      .first();
+    return row ? row.message_id : null;
+  }
+
+  async recordSend({ userId, sourceId, text, messageId, at }) {
+    await this.db
+      .prepare(
+        `INSERT INTO recent_sends (user_id, source_id, text, message_id, at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(user_id, source_id, text) DO UPDATE SET
+           message_id = excluded.message_id, at = excluded.at`
+      )
+      .bind(userId, sourceId, text, messageId, at)
+      .run();
+  }
 }
 
 export class MemoryStore {
@@ -215,6 +297,8 @@ export class MemoryStore {
     this.messages = [];
     this.messageKeys = new Set();
     this.readMarkers = new Map();
+    this.pairFailures = [];
+    this.recentSends = [];
     this.nextMessageId = 1;
   }
 
@@ -230,10 +314,25 @@ export class MemoryStore {
   }
 
   async createPairCode({ code, userId, expiresAt }) {
+    const existing = this.pairCodes.get(code);
+    if (existing && existing.userId !== userId && !existing.used) {
+      return false;
+    }
     for (const [key, entry] of this.pairCodes) {
       if (entry.userId === userId && !entry.used) this.pairCodes.delete(key);
     }
     this.pairCodes.set(code, { code, userId, expiresAt, used: false });
+    return true;
+  }
+
+  async getLivePairCode(userId, nowMs) {
+    let best = null;
+    for (const entry of this.pairCodes.values()) {
+      if (entry.userId !== userId || entry.used) continue;
+      if (entry.expiresAt <= nowMs) continue;
+      if (!best || entry.expiresAt > best.expiresAt) best = entry;
+    }
+    return best ? best.code : null;
   }
 
   async redeemPairCode(code, nowMs) {
@@ -245,13 +344,23 @@ export class MemoryStore {
     return { id: user.id, firstName: user.firstName };
   }
 
+  async recordPairFailure(at) {
+    this.pairFailures.push(at);
+  }
+
+  async pairFailuresInWindow(nowMs, windowMs) {
+    const cutoff = nowMs - windowMs;
+    return this.pairFailures.filter((at) => at > cutoff).length;
+  }
+
   async createSession(tokenHash, userId, createdAt) {
     this.sessions.set(tokenHash, { userId, createdAt });
   }
 
-  async userForToken(tokenHash) {
+  async userForToken(tokenHash, nowMs) {
     const session = this.sessions.get(tokenHash);
     if (!session) return null;
+    if (nowMs != null && session.createdAt <= nowMs - SESSION_TTL_MS) return null;
     const user = this.users.get(session.userId);
     if (!user) return null;
     return { id: user.id, firstName: user.firstName };
@@ -277,6 +386,18 @@ export class MemoryStore {
     return { ...source };
   }
 
+  async deleteSource(sourceId) {
+    this.sources.delete(sourceId);
+    this.messages = this.messages.filter((m) => m.sourceId !== sourceId);
+    this.messageKeys = new Set(
+      this.messages.map((m) => `${m.sourceId}:${m.tgMessageId}`)
+    );
+    for (const key of [...this.readMarkers.keys()]) {
+      if (key.endsWith(`:${sourceId}`)) this.readMarkers.delete(key);
+    }
+    this.recentSends = this.recentSends.filter((s) => s.sourceId !== sourceId);
+  }
+
   async addMessage({ sourceId, tgMessageId, fromName, text, at }) {
     const key = `${sourceId}:${tgMessageId}`;
     if (this.messageKeys.has(key)) {
@@ -289,6 +410,7 @@ export class MemoryStore {
       id: this.nextMessageId++,
       sourceId,
       tgMessageId,
+      tg_message_id: tgMessageId,
       from: fromName ?? null,
       text: text ?? "",
       at,
@@ -301,7 +423,7 @@ export class MemoryStore {
   async listSourcesWithUnread(userId) {
     const out = [];
     for (const s of this.sources.values()) {
-      if (s.userId !== userId && s.userId != null) continue;
+      if (s.userId !== userId) continue;
       const msgs = this.messages.filter((m) => m.sourceId === s.chatId).sort(byNewest);
       if (!msgs.length) continue;
       const lastRead = this.readMarkers.get(`${userId}:${s.chatId}`) ?? 0;
@@ -343,5 +465,27 @@ export class MemoryStore {
   async getMessage(sourceId, messageId) {
     const m = this.messages.find((x) => x.sourceId === sourceId && x.id === messageId);
     return m ? { ...m } : null;
+  }
+
+  async findRecentSend({ userId, sourceId, text, sinceMs }) {
+    let best = null;
+    for (const s of this.recentSends) {
+      if (s.userId !== userId || s.sourceId !== sourceId || s.text !== text) continue;
+      if (s.at <= sinceMs) continue;
+      if (!best || s.at > best.at) best = s;
+    }
+    return best ? best.messageId : null;
+  }
+
+  async recordSend({ userId, sourceId, text, messageId, at }) {
+    const existing = this.recentSends.find(
+      (s) => s.userId === userId && s.sourceId === sourceId && s.text === text
+    );
+    if (existing) {
+      existing.messageId = messageId;
+      existing.at = at;
+      return;
+    }
+    this.recentSends.push({ userId, sourceId, text, messageId, at });
   }
 }

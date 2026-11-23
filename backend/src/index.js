@@ -1,11 +1,16 @@
 import { D1Store } from "./store.js";
 import { createTelegram } from "./telegram.js";
-import { createAi } from "./ai.js";
+import { createAi, cleanDraft } from "./ai.js";
 
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000;
+const PAIR_FAILURE_WINDOW_MS = 10 * 60 * 1000;
+const PAIR_FAILURE_LIMIT = 10;
 const STT_MAX_BYTES = 2 * 1024 * 1024;
+const JSON_MAX_BYTES = 64 * 1024;
 const DIGEST_LINE_BUDGET = 52;
 const DM_SOURCE_TITLE = "Forwarded & DMs";
+const MAX_STORED_TEXT = 4000;
+const SEND_DEDUPE_WINDOW_MS = 120 * 1000;
 
 const FALLBACK_QUESTION = "Thanks for flagging — let me check and get back to you shortly.";
 const FALLBACK_DEFAULT = "Thanks for the update!";
@@ -45,10 +50,22 @@ function randomPairCode() {
   return String(buf[0] % 1000000).padStart(6, "0");
 }
 
+function secretsEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const enc = new TextEncoder();
+  const ba = enc.encode(a);
+  const bb = enc.encode(b);
+  if (ba.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ba.length; i++) diff |= ba[i] ^ bb[i];
+  return diff === 0;
+}
+
 export function truncateLine(text, budget = DIGEST_LINE_BUDGET) {
   const clean = String(text ?? "").replace(/\s+/g, " ").trim();
-  if (clean.length <= budget) return clean;
-  const cut = clean.slice(0, budget - 1);
+  const chars = Array.from(clean);
+  if (chars.length <= budget) return clean;
+  const cut = chars.slice(0, budget - 1).join("");
   const lastSpace = cut.lastIndexOf(" ");
   const head = lastSpace > 0 ? cut.slice(0, lastSpace) : cut;
   return `${head}…`;
@@ -71,7 +88,20 @@ function sourceTypeForChat(chat) {
 }
 
 function ownsSource(user, source) {
-  return source && (source.userId === user.id || source.userId == null);
+  return Boolean(source) && source.userId != null && source.userId === user.id;
+}
+
+function mediaPlaceholder(msg) {
+  if (msg.photo) return "[Photo]";
+  if (msg.voice) return "[Voice message]";
+  if (msg.sticker) return "[Sticker]";
+  if (msg.video) return "[Video]";
+  if (msg.document || msg.animation) return "[File]";
+  return "";
+}
+
+function isStartCommand(text) {
+  return text === "/start" || text.startsWith("/start ");
 }
 
 async function readJson(req) {
@@ -90,15 +120,34 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
     const match = /^Bearer\s+(.+)$/i.exec(header.trim());
     if (!match) return null;
     const tokenHash = await sha256Hex(match[1].trim());
-    return store.userForToken(tokenHash);
+    return store.userForToken(tokenHash, nowMs());
+  }
+
+  async function pairLockedOut() {
+    if (typeof store.pairFailuresInWindow !== "function") return false;
+    const count = await store.pairFailuresInWindow(nowMs(), PAIR_FAILURE_WINDOW_MS);
+    return count >= PAIR_FAILURE_LIMIT;
+  }
+
+  async function notePairFailure() {
+    if (typeof store.recordPairFailure === "function") {
+      await store.recordPairFailure(nowMs());
+    }
   }
 
   async function handlePair(req) {
+    if (await pairLockedOut()) return error(429, "too_many_attempts");
     const body = await readJson(req);
     const code = body?.code != null ? String(body.code).trim() : "";
-    if (!/^\d{6}$/.test(code)) return error(401, "invalid_code");
+    if (!/^\d{6}$/.test(code)) {
+      await notePairFailure();
+      return error(401, "invalid_code");
+    }
     const user = await store.redeemPairCode(code, nowMs());
-    if (!user) return error(401, "invalid_code");
+    if (!user) {
+      await notePairFailure();
+      return error(401, "invalid_code");
+    }
     const token = randomTokenHex();
     const tokenHash = await sha256Hex(token);
     await store.createSession(tokenHash, user.id, nowMs());
@@ -109,14 +158,16 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
     const user = await authenticate(req);
     if (!user) return error(401, "unauthorized");
     const rows = await store.listSourcesWithUnread(user.id);
-    const sources = rows.map((s) => ({
-      id: s.id,
-      type: s.type,
-      title: s.title,
-      unread: s.unread,
-      topLines: (s.topTexts ?? []).slice(0, 3).map((t) => truncateLine(t)),
-      lastAt: s.lastAt,
-    }));
+    const sources = rows
+      .filter((s) => s.userId === user.id)
+      .map((s) => ({
+        id: s.id,
+        type: s.type,
+        title: s.title,
+        unread: s.unread,
+        topLines: (s.topTexts ?? []).slice(0, 3).map((t) => truncateLine(t)),
+        lastAt: s.lastAt,
+      }));
     return json({ sources });
   }
 
@@ -147,7 +198,9 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
     }
     const source = await store.getSource(sourceId);
     if (!ownsSource(user, source)) return error(404, "not_found");
-    await store.markRead(user.id, sourceId, upToMessageId);
+    const newest = await store.messagesFor(sourceId, 1);
+    const clamped = newest.length ? Math.min(upToMessageId, newest[0].id) : 0;
+    await store.markRead(user.id, sourceId, clamped);
     return json({ ok: true });
   }
 
@@ -162,18 +215,59 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
     if (!ownsSource(user, source)) return error(404, "not_found");
     const text = typeof body.text === "string" ? body.text.trim() : "";
     if (text.length < 1 || text.length > 1000) return error(400, "invalid_text");
+
+    let replyToTgId;
+    if (body.replyToMessageId != null) {
+      const internalId = Number(body.replyToMessageId);
+      if (!Number.isFinite(internalId) || !Number.isInteger(internalId)) {
+        return error(400, "invalid_request");
+      }
+      const target = await store.getMessage(sourceId, internalId);
+      const tgId = target ? target.tgMessageId ?? target.tg_message_id : null;
+      if (tgId == null || !Number.isFinite(Number(tgId)) || !Number.isInteger(Number(tgId))) {
+        return error(400, "invalid_request");
+      }
+      replyToTgId = Number(tgId);
+    }
+
+    if (typeof store.findRecentSend === "function") {
+      const prior = await store.findRecentSend({
+        userId: user.id,
+        sourceId,
+        text,
+        sinceMs: nowMs() - SEND_DEDUPE_WINDOW_MS,
+      });
+      if (prior != null) {
+        return json({ ok: true, messageId: prior, deduped: true });
+      }
+    }
+
     let result;
     try {
       result = await tg.sendMessage(source.chatId ?? source.id, text, {
-        replyToMessageId: body.replyToMessageId ?? undefined,
+        replyToMessageId: replyToTgId,
       });
     } catch {
-      return error(502, "send_failed");
+      if (replyToTgId == null) return error(502, "send_failed");
+      try {
+        result = await tg.sendMessage(source.chatId ?? source.id, text, {});
+      } catch {
+        return error(502, "send_failed");
+      }
     }
     const messageId =
       typeof result === "number"
         ? result
         : result?.message_id ?? result?.messageId ?? null;
+    if (typeof store.recordSend === "function" && messageId != null) {
+      await store.recordSend({
+        userId: user.id,
+        sourceId,
+        text,
+        messageId,
+        at: nowMs(),
+      });
+    }
     return json({ ok: true, messageId });
   }
 
@@ -199,8 +293,9 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
         draft = null;
       }
     }
-    if (typeof draft === "string" && draft.trim()) {
-      return json({ draft: draft.trim(), source: "llm" });
+    const cleaned = typeof draft === "string" ? cleanDraft(draft) : null;
+    if (cleaned) {
+      return json({ draft: cleaned, source: "llm" });
     }
     const fallback = String(message.text ?? "").includes("?")
       ? FALLBACK_QUESTION
@@ -227,24 +322,42 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
     return json({ text });
   }
 
+  async function issuePairCode(sender, chatId) {
+    if (typeof store.getLivePairCode === "function") {
+      const live = await store.getLivePairCode(sender.id, nowMs());
+      if (live) return live;
+    }
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const code = randomPairCode();
+      const created = await store.createPairCode({
+        code,
+        userId: sender.id,
+        expiresAt: nowMs() + PAIR_CODE_TTL_MS,
+      });
+      if (created !== false) return code;
+    }
+    return null;
+  }
+
   async function storeIncoming(msg, { isChannelPost = false } = {}) {
     const chat = msg?.chat;
     if (!chat || chat.id == null) return;
+    if (msg.message_id == null) return;
+    if (msg.is_automatic_forward === true) return;
     const at = msg.date ? msg.date * 1000 : nowMs();
-    const text = msg.text ?? msg.caption ?? "";
+    let text = msg.text ?? msg.caption ?? "";
+    if (typeof text !== "string") text = String(text ?? "");
+    if (!text) text = mediaPlaceholder(msg);
+    text = Array.from(text).slice(0, MAX_STORED_TEXT).join("");
     const type = isChannelPost ? "channel" : sourceTypeForChat(chat);
 
     if (type === "dm") {
       const sender = msg.from;
       if (!sender || sender.id == null) return;
       await store.upsertUser(sender.id, displayName(sender), nowMs());
-      if (typeof text === "string" && text.trim().startsWith("/start")) {
-        const code = randomPairCode();
-        await store.createPairCode({
-          code,
-          userId: sender.id,
-          expiresAt: nowMs() + PAIR_CODE_TTL_MS,
-        });
+      if (isStartCommand(text.trim())) {
+        const code = await issuePairCode(sender, chat.id);
+        if (code == null) return;
         try {
           await tg.sendMessage(
             chat.id,
@@ -275,22 +388,15 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
       return;
     }
 
-    let ownerId = null;
-    if (msg.from && msg.from.id != null && !msg.from.is_bot) {
-      ownerId = msg.from.id;
-      await store.upsertUser(ownerId, displayName(msg.from), nowMs());
-    }
     await store.upsertSource({
       chatId: chat.id,
-      userId: ownerId,
+      userId: null,
       type,
       title: chat.title ?? displayName(chat),
       createdAt: nowMs(),
     });
     if (!text) return;
-    const fromName = isChannelPost
-      ? displayName(msg.sender_chat ?? chat)
-      : displayName(msg.from ?? msg.sender_chat ?? chat);
+    const fromName = displayName(msg.sender_chat ?? msg.from ?? chat);
     await store.addMessage({
       sourceId: chat.id,
       tgMessageId: msg.message_id,
@@ -304,6 +410,13 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
     const member = update?.my_chat_member;
     const chat = member?.chat;
     if (!chat || chat.id == null) return;
+    const newStatus = member.new_chat_member?.status;
+    if (newStatus === "left" || newStatus === "kicked") {
+      if (typeof store.deleteSource === "function") {
+        await store.deleteSource(chat.id);
+      }
+      return;
+    }
     const from = member.from;
     let ownerId = null;
     if (from && from.id != null) {
@@ -321,7 +434,7 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
 
   async function handleWebhook(req) {
     const secret = req.headers.get("x-telegram-bot-api-secret-token");
-    if (!webhookSecret || !secret || secret !== webhookSecret) {
+    if (!webhookSecret || !secret || !secretsEqual(secret, webhookSecret)) {
       return error(401, "unauthorized");
     }
     try {
@@ -334,7 +447,6 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
         } else if (update.my_chat_member) {
           await handleMyChatMember(update);
         }
-        // edited_message and anything else: intentionally ignored.
       }
     } catch (err) {
       console.error("webhook handler failed", err?.message ?? "unknown");
@@ -347,6 +459,17 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
       const url = new URL(req.url);
       const path = url.pathname.replace(/\/+$/, "") || "/";
       const method = req.method.toUpperCase();
+
+      if (method === "POST" && path.startsWith("/v1/")) {
+        const lengthHeader = req.headers.get("content-length");
+        if (lengthHeader != null) {
+          const length = Number(lengthHeader);
+          if (Number.isFinite(length)) {
+            const limit = path === "/v1/stt" ? STT_MAX_BYTES : JSON_MAX_BYTES;
+            if (length > limit) return error(413, "too_large");
+          }
+        }
+      }
 
       if (method === "GET" && path === "/health") return json({ ok: true });
       if (method === "POST" && path === "/telegram/webhook") return handleWebhook(req);
@@ -381,7 +504,7 @@ export default {
   async fetch(req, env) {
     const app = createApp({
       store: new D1Store(env.DB),
-      tg: createTelegram({ token: env.BOT_TOKEN }),
+      tg: createTelegram({ token: env.TELEGRAM_BOT_TOKEN ?? env.BOT_TOKEN }),
       ai: createAi({ groqKey: env.GROQ_API_KEY }),
       webhookSecret: env.WEBHOOK_SECRET,
       now: () => Date.now(),

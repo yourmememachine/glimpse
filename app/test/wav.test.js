@@ -26,3 +26,17 @@ test('wav custom sample rate and empty input', () => {
 test('concatFrames joins in order', () => {
   assert.deepEqual([...concatFrames([new Uint8Array([1, 2]), new Uint8Array([3])])], [1, 2, 3]);
 });
+
+import { resampleFloat32 } from '../src/wav.js';
+
+test('resampleFloat32 halves the length going 32k -> 16k', () => {
+  const input = new Float32Array(3200).map((_, i) => Math.sin(i / 10));
+  const out = resampleFloat32(input, 32000, 16000);
+  assert.equal(out.length, 1600);
+});
+
+test('resampleFloat32 is a copy at the target rate', () => {
+  const input = new Float32Array([0.1, -0.2, 0.3]);
+  const out = resampleFloat32(input, 16000, 16000);
+  assert.deepEqual([...out], [...input]);
+});

@@ -35,6 +35,19 @@ CREATE TABLE IF NOT EXISTS messages (
   UNIQUE(source_id, tg_message_id)
 );
 
+CREATE TABLE IF NOT EXISTS pair_failures (
+  at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS recent_sends (
+  user_id INTEGER,
+  source_id INTEGER,
+  text TEXT,
+  message_id INTEGER,
+  at INTEGER,
+  PRIMARY KEY (user_id, source_id, text)
+);
+
 CREATE TABLE IF NOT EXISTS read_markers (
   user_id INTEGER,
   source_id INTEGER,

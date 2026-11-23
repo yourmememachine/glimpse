@@ -11,6 +11,27 @@ const SYSTEM_PROMPT =
   "Draft a brief friendly reply to the message, one or two sentences, ready to send. " +
   "Do not put quotes around it and do not add any preamble.";
 
+export function cleanDraft(text) {
+  if (typeof text !== "string") return null;
+  let out = text.trim();
+  if (out.startsWith("```")) {
+    out = out.replace(/^```[a-zA-Z0-9_-]*\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
+  }
+  for (let i = 0; i < 2; i++) {
+    if (
+      out.length >= 2 &&
+      ((out.startsWith('"') && out.endsWith('"')) ||
+        (out.startsWith("'") && out.endsWith("'")))
+    ) {
+      out = out.slice(1, -1).trim();
+    } else {
+      break;
+    }
+  }
+  out = Array.from(out).slice(0, 300).join("");
+  return out ? out : null;
+}
+
 function contextText(ctx) {
   if (!ctx) return "";
   const message = ctx.message ?? ctx;
@@ -34,6 +55,7 @@ export function createAi({ groqKey, fetchImpl } = {}) {
     try {
       const res = await doFetch(CHAT_URL, {
         method: "POST",
+        signal: AbortSignal.timeout(30_000),
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${groqKey}`,
@@ -50,13 +72,9 @@ export function createAi({ groqKey, fetchImpl } = {}) {
       });
       if (!res.ok) return null;
       const data = await res.json();
-      let text = data?.choices?.[0]?.message?.content;
+      const text = data?.choices?.[0]?.message?.content;
       if (typeof text !== "string") return null;
-      text = text.trim();
-      if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
-        text = text.slice(1, -1).trim();
-      }
-      return text ? text : null;
+      return cleanDraft(text);
     } catch {
       return null;
     }
@@ -74,6 +92,7 @@ export function createAi({ groqKey, fetchImpl } = {}) {
       form.append("model", AUDIO_MODEL);
       const res = await doFetch(AUDIO_URL, {
         method: "POST",
+        signal: AbortSignal.timeout(30_000),
         headers: { authorization: `Bearer ${groqKey}` },
         body: form,
       });

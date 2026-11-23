@@ -85,6 +85,25 @@ function groupUpdate(text, { messageId = 1, date = 1_700_000_000 } = {}) {
   };
 }
 
+
+function memberUpdate(chatId, type, title, status = "member") {
+  return {
+    update_id: 9000 + chatId,
+    my_chat_member: {
+      chat: { id: chatId, type, title },
+      from: { id: USER_ID, first_name: "Sam" },
+      date: 1_700_000_000,
+      old_chat_member: { user: { id: 9999, is_bot: true, first_name: "Glimpse" }, status: "left" },
+      new_chat_member: { user: { id: 9999, is_bot: true, first_name: "Glimpse" }, status },
+    },
+  };
+}
+
+async function addBotToGroup(env) {
+  const res = await webhook(env.app, memberUpdate(GROUP_ID, "supergroup", "Team Chat"));
+  assert.equal(res.status, 200);
+}
+
 function lastCode(tg) {
   const text = tg.sent[tg.sent.length - 1].text;
   const match = /\b(\d{6})\b/.exec(text);
@@ -147,20 +166,20 @@ test("pairing code is single-use", async () => {
   assert.equal(second.status, 401);
 });
 
-test("a fresh /start replaces the previous unused code", async () => {
+test("/start re-sends the live code instead of minting a new one", async () => {
   const env = makeEnv();
   await webhook(env.app, dmUpdate("/start", { messageId: 1 }));
   const first = lastCode(env.tg);
-  let second = first;
-  let n = 2;
-  while (second === first) {
-    await webhook(env.app, dmUpdate("/start", { messageId: n++ }));
-    second = lastCode(env.tg);
-  }
-  const stale = await env.app.fetch(req("/v1/pair", { method: "POST", body: { code: first } }));
-  assert.equal(stale.status, 401);
-  const fresh = await env.app.fetch(req("/v1/pair", { method: "POST", body: { code: second } }));
-  assert.equal(fresh.status, 200);
+  await webhook(env.app, dmUpdate("/start", { messageId: 2 }));
+  const second = lastCode(env.tg);
+  assert.equal(second, first);
+  const pairRes = await env.app.fetch(req("/v1/pair", { method: "POST", body: { code: first } }));
+  assert.equal(pairRes.status, 200);
+  // Once used, the next /start mints a fresh code.
+  await webhook(env.app, dmUpdate("/start", { messageId: 3 }));
+  const third = lastCode(env.tg);
+  const pair2 = await env.app.fetch(req("/v1/pair", { method: "POST", body: { code: third } }));
+  assert.equal(pair2.status, 200);
 });
 
 test("webhook rejects a wrong or missing secret", async () => {
@@ -193,6 +212,7 @@ test("digest requires auth", async () => {
 test("group messages land in the digest with unread counts and truncated lines", async () => {
   const env = makeEnv();
   const token = await pairToken(env);
+  await addBotToGroup(env);
   const long =
     "The deployment window moved to Friday evening because the staging checks took much longer than anyone expected this week";
   await webhook(env.app, groupUpdate("standup in five", { messageId: 10, date: 1_700_000_100 }));
@@ -233,6 +253,7 @@ test("plain DMs are stored under the forwarded & DMs source", async () => {
 test("channel posts are stored under a channel source", async () => {
   const env = makeEnv();
   const token = await pairToken(env);
+  await webhook(env.app, memberUpdate(-1002, "channel", "Announcements", "administrator"));
   await webhook(env.app, {
     update_id: 1,
     channel_post: {
@@ -254,6 +275,7 @@ test("channel posts are stored under a channel source", async () => {
 test("source endpoint returns messages newest first", async () => {
   const env = makeEnv();
   const token = await pairToken(env);
+  await addBotToGroup(env);
   await webhook(env.app, groupUpdate("first", { messageId: 1, date: 1_700_000_100 }));
   await webhook(env.app, groupUpdate("second", { messageId: 2, date: 1_700_000_200 }));
   const res = await env.app.fetch(req(`/v1/source/${GROUP_ID}`, { token }));
@@ -270,6 +292,7 @@ test("source endpoint returns messages newest first", async () => {
 test("markRead reduces unread and never moves backwards", async () => {
   const env = makeEnv();
   const token = await pairToken(env);
+  await addBotToGroup(env);
   await webhook(env.app, groupUpdate("one", { messageId: 1, date: 1_700_000_100 }));
   await webhook(env.app, groupUpdate("two", { messageId: 2, date: 1_700_000_200 }));
 
@@ -300,6 +323,7 @@ test("markRead reduces unread and never moves backwards", async () => {
 test("reply posts through the bot to the source chat", async () => {
   const env = makeEnv();
   const token = await pairToken(env);
+  await addBotToGroup(env);
   await webhook(env.app, groupUpdate("ping", { messageId: 1, date: 1_700_000_100 }));
   const sentBefore = env.tg.sent.length;
   const res = await env.app.fetch(
@@ -316,6 +340,7 @@ test("reply posts through the bot to the source chat", async () => {
 test("reply rejects empty and overlong text", async () => {
   const env = makeEnv();
   const token = await pairToken(env);
+  await addBotToGroup(env);
   await webhook(env.app, groupUpdate("ping", { messageId: 1, date: 1_700_000_100 }));
   for (const text of ["", "   ", "x".repeat(1001)]) {
     const res = await env.app.fetch(
@@ -332,6 +357,7 @@ test("reply rejects empty and overlong text", async () => {
 
 async function draftSetup(env, text) {
   const token = await pairToken(env);
+  await addBotToGroup(env);
   await webhook(env.app, groupUpdate(text, { messageId: 1, date: 1_700_000_100 }));
   const srcRes = await env.app.fetch(req(`/v1/source/${GROUP_ID}`, { token }));
   const { messages } = await srcRes.json();

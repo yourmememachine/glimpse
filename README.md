@@ -16,9 +16,15 @@ accept as-is, or a short voice note that is transcribed and sent as text.
 ## How it works
 
 1. Pair once: message the Glimpse bot `/start` on Telegram, get a 6-digit
-   code, and enter it in the app. The app stores only a session token.
+   code, and type it into the app's pairing panel in your phone browser
+   (the code is not entered on the glasses). The app stores only a
+   session token.
 2. The bot collects messages from the groups and channels it belongs to,
-   plus anything you forward to it.
+   plus anything you forward to it. The digest covers exactly the chats
+   the bot has been added to — groups it is a member of and channels
+   where it is an administrator — plus forwards sent to the bot DM.
+   That membership *is* the picker: there is no separate chat list to
+   configure, and a chat the bot has not been added to never appears.
 3. The glasses show a digest — sources ordered by most recent activity,
    with unread counts and up to three preview lines per source (≤ 52
    characters each).
@@ -65,8 +71,16 @@ accept as-is, or a short voice note that is transcribed and sent as text.
 2. Send `/setprivacy` for your bot and choose **Disable** if you want the
    bot to see ordinary group messages (not just commands and mentions).
    The bot still only ever receives messages from chats it has been
-   added to — see *Safety & privacy* below.
-3. Add the bot to the groups and channels you want in your digest.
+   added to — see *Safety & privacy* below. Note: Telegram applies the
+   privacy-mode change only when the bot joins a group, so after
+   disabling privacy mode you must remove the bot from, and re-add it
+   to, any group it already belongs to before it will see that group's
+   ordinary messages.
+3. Add the bot to the groups and channels you want in your digest. For
+   a **channel**, the bot must be added as a channel **administrator**
+   with the **Post Messages** permission — a channel the bot is merely
+   subscribed to sends it nothing, so no channel posts are received
+   until it is an admin there.
 
 ### 2. Deploy the Worker backend
 
@@ -84,15 +98,20 @@ wrangler d1 execute glimpse --remote --file=schema.sql
 
 # Secrets (never commit these)
 wrangler secret put TELEGRAM_BOT_TOKEN   # the BotFather token
-wrangler secret put WEBHOOK_SECRET       # a long random string you invent
+wrangler secret put WEBHOOK_SECRET       # a long random string you invent —
+                                         # use ONLY A–Z, a–z, 0–9, _ and -
+                                         # characters (Telegram rejects any
+                                         # other characters in secret_token)
 wrangler secret put GROQ_API_KEY         # optional; drafts/STT degrade without it
 
-# Point Telegram at the Worker (replace the URL and secret)
+# Deploy the Worker FIRST — the webhook URL must be live before
+# Telegram will accept it in the next step.
+wrangler deploy
+
+# THEN point Telegram at the deployed Worker (replace the URL and secret)
 curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
   -d "url=https://<your-worker>.workers.dev/telegram/webhook" \
   -d "secret_token=<WEBHOOK_SECRET>"
-
-wrangler deploy
 ```
 
 Check it is alive: `curl https://<your-worker>.workers.dev/health`
@@ -116,7 +135,8 @@ submission artifact.
 
 1. On Telegram, open your bot and send `/start`. The bot replies with a
    6-digit pairing code (valid for 10 minutes, single use).
-2. Open Glimpse on the glasses (or in the simulator) and enter the code.
+2. Open Glimpse and type the code into the app's pairing panel in your
+   phone browser — the code is entered on the phone, not on the glasses.
 3. The app exchanges the code for a session token and shows your digest.
    Only the hash of the token is stored on the server.
 
@@ -144,6 +164,15 @@ during the November 23–29, 2026 build window.
   leave chats, delete messages, or change any chat settings. Its whole
   surface is: read a digest, read messages, mark read, and send a reply
   you composed or approved on the glasses.
+- **What leaves your machine.** When you ask for a drafted reply, the
+  message text and recent context from that chat are sent to Groq so
+  its model can draft the reply; when you dictate a voice note, the
+  voice audio is sent to Groq for transcription. Nothing else is sent
+  to third parties.
+- **Retention.** Messages the bot receives are stored in the backend
+  database (D1) so the digest can show them. When the bot is removed
+  from a chat, that chat's stored history is deleted. The operator can
+  wipe everything at once by deleting the D1 database.
 
 ## Known limits
 

@@ -1,5 +1,6 @@
 export const BASE_URL = 'https://glimpse-backend.example.workers.dev';
 export const TOKEN_KEY = 'glimpse_token';
+export const REQUEST_TIMEOUT_MS = 15000;
 export function createApi({ baseUrl = BASE_URL, storage, fetchFn = fetch } = {}) {
   if (!storage) throw new Error('storage required');
   async function req(path, opts = {}) {
@@ -10,7 +11,8 @@ export function createApi({ baseUrl = BASE_URL, storage, fetchFn = fetch } = {})
       headers['Content-Type'] = 'application/json';
       opts = { ...opts, body: JSON.stringify(opts.body) };
     }
-    const res = await fetchFn(baseUrl + path, { ...opts, headers });
+    const signal = opts.signal || AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const res = await fetchFn(baseUrl + path, { ...opts, headers, signal });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) { const e = new Error(data.error || `http_${res.status}`); e.status = res.status; e.code = data.error; throw e; }
     return data;
@@ -18,6 +20,10 @@ export function createApi({ baseUrl = BASE_URL, storage, fetchFn = fetch } = {})
   return {
     async pair(code) { const d = await req('/v1/pair', { method: 'POST', body: { code } }); await storage.set(TOKEN_KEY, d.token); return d; },
     async hasToken() { return !!(await storage.get(TOKEN_KEY)); },
+    async clearToken() {
+      if (typeof storage.remove === 'function') await storage.remove(TOKEN_KEY);
+      else await storage.set(TOKEN_KEY, '');
+    },
     digest: () => req('/v1/digest'),
     source: (id) => req(`/v1/source/${encodeURIComponent(id)}?limit=20`),
     markRead: (sourceId, upToMessageId) => req('/v1/read', { method: 'POST', body: { sourceId, upToMessageId } }),

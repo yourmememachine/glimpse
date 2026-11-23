@@ -4,11 +4,13 @@
 import {
   waitForEvenAppBridge,
   CreateStartUpPageContainer,
+  RebuildPageContainer,
   TextContainerProperty,
   TextContainerUpgrade,
   AudioInputSource,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk';
+import { resampleFloat32, float32ToPcm16 } from './wav.js';
 
 export function mapEventType(t) {
   if (t === undefined || t === null || t === OsEventTypeList.CLICK_EVENT) return 'click';
@@ -26,13 +28,36 @@ function withTimeout(promise, ms) {
   ]);
 }
 
-export async function connectRuntime({ onGesture, onNoFrames }) {
+export async function connectRuntime({ onGesture, onNoFrames, urlSearch } = {}) {
+  // SDK detection: ?preview forces the fallback. Otherwise wait for the
+  // bridge, then probe it with a benign storage read raced against 1.5s —
+  // the wait alone can resolve in plain browsers, so only a probe that
+  // actually answers counts as SDK mode; failure or timeout = fallback.
+  const search = urlSearch ?? (typeof globalThis.location !== 'undefined' ? globalThis.location.search : '');
+  if (new URLSearchParams(search || '').has('preview')) {
+    return createFallbackRuntime({ onGesture, onNoFrames });
+  }
   let bridge = null;
   try {
     bridge = await withTimeout(waitForEvenAppBridge(), 2500);
   } catch { bridge = null; }
-  if (bridge) return createSdkRuntime(bridge, { onGesture, onNoFrames });
-  return createFallbackRuntime({ onGesture, onNoFrames });
+  if (!bridge) return createFallbackRuntime({ onGesture, onNoFrames });
+  try {
+    await withTimeout(Promise.resolve(bridge.getLocalStorage('glimpse_probe')), 1500);
+  } catch {
+    return createFallbackRuntime({ onGesture, onNoFrames });
+  }
+  return createSdkRuntime(bridge, { onGesture, onNoFrames });
+}
+
+function captureContainerProps(content) {
+  return {
+    containerID: 1, containerName: 'main',
+    xPosition: 0, yPosition: 0, width: 576, height: 288,
+    // An event-capture container only takes focus with a visible border.
+    borderWidth: 2, borderColor: 1,
+    isEventCapture: 1, content,
+  };
 }
 
 function createSdkRuntime(bridge, { onGesture, onNoFrames }) {
@@ -40,24 +65,30 @@ function createSdkRuntime(bridge, { onGesture, onNoFrames }) {
   let collecting = false;
   let noFramesTimer = null;
   let gestureHandler = onGesture;
+  let stopPromise = null;
 
   const runtime = {
     mode: 'sdk',
+    lastRenderError: null,
     storage: {
       get: (k) => bridge.getLocalStorage(k),
       set: (k, v) => bridge.setLocalStorage(k, v),
+      remove: (k) => bridge.setLocalStorage(k, ''),
     },
     setGestureHandler(fn) { gestureHandler = fn; },
     async init() {
       const container = new CreateStartUpPageContainer({
         containerTotalNum: 1,
-        textObject: [new TextContainerProperty({
-          containerID: 1, containerName: 'main',
-          xPosition: 0, yPosition: 0, width: 576, height: 288,
-          isEventCapture: 1, content: 'Glimpse',
-        })],
+        textObject: [new TextContainerProperty(captureContainerProps('Glimpse'))],
       });
-      await bridge.createStartUpPageContainer(container);
+      const result = await bridge.createStartUpPageContainer(container);
+      const code = typeof result === 'number' ? result : Number(result);
+      if (code !== 0) {
+        // Fall back to a page rebuild; only a dead rebuild is fatal.
+        const rebuilt = await runtime._rebuild('Glimpse', 'Could not start Glimpse');
+        if (!rebuilt) throw new Error('container_create_failed');
+        runtime.lastRenderError = 'container_create_failed';
+      }
       bridge.onEvenHubEvent((event) => {
         if (event.audioEvent?.audioPcm && collecting) { frames.push(new Uint8Array(event.audioEvent.audioPcm)); return; }
         const item = event.textEvent || event.listEvent || event.sysEvent;
@@ -68,12 +99,28 @@ function createSdkRuntime(bridge, { onGesture, onNoFrames }) {
         if (gesture) gestureHandler?.(gesture);
       });
     },
-    render(view) {
+    async _rebuild(title, line) {
+      try {
+        return await bridge.rebuildPageContainer(new RebuildPageContainer({
+          containerTotalNum: 1,
+          textObject: [new TextContainerProperty(captureContainerProps(`${title}\n${line}`))],
+        }));
+      } catch { return false; }
+    },
+    async render(view) {
       const content = `${view.title}\n${view.lines.join('\n')}`;
-      bridge.textContainerUpgrade(new TextContainerUpgrade({
-        containerID: 1, containerName: 'main',
-        contentOffset: 0, contentLength: content.length, content,
-      })).catch(() => {});
+      let ok = false;
+      try {
+        // Full updates only: partial-update fields (contentOffset /
+        // contentLength) are omitted, they corrupt long-to-short changes.
+        ok = await bridge.textContainerUpgrade(new TextContainerUpgrade({
+          containerID: 1, containerName: 'main', content,
+        }));
+      } catch { ok = false; }
+      if (ok !== true) {
+        runtime.lastRenderError = 'render_failed';
+        await runtime._rebuild(view.title, 'Could not display this screen');
+      }
     },
     async startAudio() {
       frames = []; collecting = true;
@@ -81,10 +128,16 @@ function createSdkRuntime(bridge, { onGesture, onNoFrames }) {
       clearTimeout(noFramesTimer);
       noFramesTimer = setTimeout(() => { if (collecting && frames.length === 0) onNoFrames?.(); }, 1000);
     },
-    async stopAudio() {
-      collecting = false; clearTimeout(noFramesTimer);
-      try { await bridge.audioControl(false); } catch { /* ignore */ }
-      const out = frames; frames = []; return out;
+    stopAudio() {
+      // Race guard: a stop already in flight is shared, never re-entered.
+      if (stopPromise) return stopPromise;
+      stopPromise = (async () => {
+        collecting = false; clearTimeout(noFramesTimer);
+        try { await bridge.audioControl(false); } catch { /* ignore */ }
+        const out = frames; frames = []; return out;
+      })();
+      stopPromise.finally(() => { stopPromise = null; }).catch(() => {});
+      return stopPromise;
     },
     exit() { bridge.shutDownPageContainer(1).catch(() => {}); },
   };
@@ -96,12 +149,14 @@ function createFallbackRuntime({ onGesture, onNoFrames }) {
   let gestureHandler = onGesture;
   let stream = null; let audioCtx = null; let processor = null; let frames = [];
   let noFramesTimer = null;
+  let stopPromise = null;
 
   const runtime = {
     mode: 'fallback',
     storage: {
       async get(k) { try { return window.localStorage.getItem(k) || ''; } catch { return ''; } },
       async set(k, v) { try { window.localStorage.setItem(k, v); } catch { /* ignore */ } return true; },
+      async remove(k) { try { window.localStorage.removeItem(k); } catch { /* ignore */ } return true; },
     },
     setGestureHandler(fn) { gestureHandler = fn; },
     async init() {
@@ -123,32 +178,39 @@ function createFallbackRuntime({ onGesture, onNoFrames }) {
     async startAudio() {
       frames = [];
       clearTimeout(noFramesTimer);
-      noFramesTimer = setTimeout(() => { if (frames.length === 0) onNoFrames?.(); }, 1000);
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      } catch { onNoFrames?.(); return; }
+      // The no-frames clock starts only once capture is actually open,
+      // so a slow permission prompt is not mistaken for a dead mic.
+      noFramesTimer = setTimeout(() => { if (frames.length === 0) onNoFrames?.(); }, 1000);
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const sourceRate = audioCtx.sampleRate;
         const source = audioCtx.createMediaStreamSource(stream);
-        processor = audioCtx.createScriptProcessor(160, 1, 1); // ~10ms at 16kHz
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
         processor.onaudioprocess = (e) => {
           const f32 = e.inputBuffer.getChannelData(0);
-          const pcm = new Uint8Array(f32.length * 2);
-          const v = new DataView(pcm.buffer);
-          for (let i = 0; i < f32.length; i++) {
-            const s = Math.max(-1, Math.min(1, f32[i]));
-            v.setInt16(i * 2, s * 0x7fff, true);
-          }
-          frames.push(pcm);
+          // Capture runs at the device rate; the backend wants 16 kHz.
+          const resampled = resampleFloat32(f32, sourceRate, 16000);
+          frames.push(float32ToPcm16(resampled));
         };
         source.connect(processor); processor.connect(audioCtx.destination);
-      } catch { /* noFrames timer reports it */ }
+      } catch { onNoFrames?.(); }
     },
-    async stopAudio() {
-      clearTimeout(noFramesTimer);
-      try { processor?.disconnect(); } catch { /* ignore */ }
-      try { await audioCtx?.close(); } catch { /* ignore */ }
-      stream?.getTracks().forEach((t) => t.stop());
-      stream = null; audioCtx = null; processor = null;
-      const out = frames; frames = []; return out;
+    stopAudio() {
+      // Race guard: a stop already in flight is shared, never re-entered.
+      if (stopPromise) return stopPromise;
+      stopPromise = (async () => {
+        clearTimeout(noFramesTimer);
+        try { processor?.disconnect(); } catch { /* ignore */ }
+        try { await audioCtx?.close(); } catch { /* ignore */ }
+        stream?.getTracks().forEach((t) => t.stop());
+        stream = null; audioCtx = null; processor = null;
+        const out = frames; frames = []; return out;
+      })();
+      stopPromise.finally(() => { stopPromise = null; }).catch(() => {});
+      return stopPromise;
     },
     exit() { /* nothing to exit in the browser preview */ },
   };

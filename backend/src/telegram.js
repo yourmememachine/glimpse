@@ -14,6 +14,7 @@ export function createTelegram({ token, fetchImpl } = {}) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) throw new Error(`telegram_send_failed:${res.status}`);
     let data = null;

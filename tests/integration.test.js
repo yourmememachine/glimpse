@@ -214,6 +214,24 @@ test('full product story', async (t) => {
       assert.equal(res.status, 200, `group message ${i}: ${res.text}`);
     }
 
+    // Same attribution for the channel: the paired user promotes the bot
+    // to channel administrator (my_chat_member) before any posts arrive,
+    // so the channel source is owned by the paired user.
+    const promoted = await webhook({
+      my_chat_member: {
+        chat: { id: CHANNEL_ID, type: 'channel', title: CHANNEL_TITLE },
+        from: { id: USER_ID, first_name: 'Demo', is_bot: false },
+        date: 1763000060,
+        old_chat_member: { user: { id: 9999, first_name: 'Glimpse', is_bot: true }, status: 'left' },
+        new_chat_member: {
+          user: { id: 9999, first_name: 'Glimpse', is_bot: true },
+          status: 'administrator',
+          can_post_messages: true,
+        },
+      },
+    });
+    assert.equal(promoted.status, 200, `channel my_chat_member: ${promoted.text}`);
+
     const channelTexts = [
       'Market update: majors are range-bound this morning, volume is thin.',
       'Reminder: community call starts in one hour, agenda is pinned above.',
@@ -224,11 +242,23 @@ test('full product story', async (t) => {
           message_id: 201 + i,
           date: base + 1000 + i * 60,
           chat: { id: CHANNEL_ID, type: 'channel', title: CHANNEL_TITLE },
+          sender_chat: { id: CHANNEL_ID, type: 'channel', title: CHANNEL_TITLE },
           text: channelTexts[i],
         },
       });
       assert.equal(res.status, 200, `channel post ${i}: ${res.text}`);
     }
+
+    // A message in a chat the bot was never attributed to the paired user
+    // for (no my_chat_member from the paired user) must stay ownerless
+    // with respect to the paired user and never surface in their digest.
+    const stray = await webhook(tgMessage({
+      chatId: -1004001, chatType: 'supergroup', title: 'Unowned Corner',
+      fromId: 2009, fromName: 'Stranger',
+      text: 'This chat was never added by the paired user.',
+      messageId: 401, date: base + 3000,
+    }));
+    assert.equal(stray.status, 200, `ownerless message: ${stray.text}`);
 
     const fwd = await webhook(tgMessage({
       chatId: USER_ID, chatType: 'private', fromId: USER_ID, fromName: 'Demo',
@@ -254,6 +284,10 @@ test('full product story', async (t) => {
     assert.ok(groupSource, 'group source missing');
     assert.ok(channelSource, 'channel source missing');
     assert.ok(dmSource, 'dm (forwarded inbox) source missing');
+    assert.ok(
+      !sources.some((s) => String(s.id) === '-1004001' || s.title === 'Unowned Corner'),
+      'an ownerless source (no my_chat_member from the paired user) must not appear in the digest',
+    );
 
     assert.equal(groupSource.unread, 3);
     assert.equal(channelSource.unread, 2);
