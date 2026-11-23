@@ -21,6 +21,21 @@ export function mapEventType(t) {
   return null;
 }
 
+// Routes one hub event to audio capture or a gesture. Events arrive
+// from the hub as-is: a malformed one (null, a non-object, or missing
+// its nested payload) must never throw inside the listener — it is
+// simply not routable.
+export function routeHubEvent(event, { isCollecting, onAudioFrame, onGesture } = {}) {
+  if (!event || typeof event !== 'object') return;
+  if (event.audioEvent?.audioPcm && isCollecting()) { onAudioFrame(event.audioEvent.audioPcm); return; }
+  const item = event.textEvent || event.listEvent || event.sysEvent;
+  if (!item) return;
+  // Long press is reported on sysEvent in some firmware builds.
+  if (event.sysEvent && (item.eventType === OsEventTypeList.LONG_PRESS_EVENT)) { onGesture('longPress'); return; }
+  const gesture = mapEventType(item.eventType);
+  if (gesture) onGesture(gesture);
+}
+
 function withTimeout(promise, ms) {
   return Promise.race([
     promise,
@@ -89,15 +104,11 @@ function createSdkRuntime(bridge, { onGesture, onNoFrames }) {
         if (!rebuilt) throw new Error('container_create_failed');
         runtime.lastRenderError = 'container_create_failed';
       }
-      bridge.onEvenHubEvent((event) => {
-        if (event.audioEvent?.audioPcm && collecting) { frames.push(new Uint8Array(event.audioEvent.audioPcm)); return; }
-        const item = event.textEvent || event.listEvent || event.sysEvent;
-        if (!item) return;
-        // Long press is reported on sysEvent in some firmware builds.
-        if (event.sysEvent && (item.eventType === OsEventTypeList.LONG_PRESS_EVENT)) { gestureHandler?.('longPress'); return; }
-        const gesture = mapEventType(item.eventType);
-        if (gesture) gestureHandler?.(gesture);
-      });
+      bridge.onEvenHubEvent((event) => routeHubEvent(event, {
+        isCollecting: () => collecting,
+        onAudioFrame: (pcm) => { frames.push(new Uint8Array(pcm)); },
+        onGesture: (g) => gestureHandler?.(g),
+      }));
     },
     async _rebuild(title, line) {
       try {

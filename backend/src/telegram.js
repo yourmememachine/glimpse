@@ -34,5 +34,29 @@ export function createTelegram({ token, fetchImpl } = {}) {
     return data?.result ?? data;
   }
 
-  return { sendMessage };
+  async function getChatMember(chatId, userId) {
+    if (!token) throw new Error("telegram_not_configured");
+    if (typeof doFetch !== "function") throw new Error("fetch_unavailable");
+    const res = await doFetch(`https://api.telegram.org/bot${token}/getChatMember`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, user_id: userId }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {
+      data = null;
+    }
+    if (!res.ok || (data && data.ok === false)) {
+      const err = new Error(`telegram_get_chat_member_failed:${res.status}`);
+      err.status = res.status;
+      err.description = data?.description ?? null;
+      throw err;
+    }
+    return data?.result ?? null;
+  }
+
+  return { sendMessage, getChatMember };
 }

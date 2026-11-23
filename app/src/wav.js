@@ -29,10 +29,17 @@ export function concatFrames(frames) {
   for (const f of frames) { out.set(f, off); off += f.length; }
   return out;
 }
+// A WAV produced here is a 44-byte RIFF header plus the PCM samples.
+// A capture that produced no samples is therefore exactly 44 bytes and
+// must be treated as "no audio", not uploaded for transcription.
+export const WAV_HEADER_BYTES = 44;
+export function wavHasAudio(wav) {
+  return wav != null && wav.length > WAV_HEADER_BYTES;
+}
 export function pcmToWav(frames, sampleRate = 16000) {
   const pcm = concatFrames(frames);
   const dataSize = pcm.length;
-  const out = new Uint8Array(44 + dataSize);
+  const out = new Uint8Array(WAV_HEADER_BYTES + dataSize);
   const v = new DataView(out.buffer);
   const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
   writeStr(0, 'RIFF'); v.setUint32(4, 36 + dataSize, true); writeStr(8, 'WAVE');

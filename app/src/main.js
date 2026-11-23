@@ -17,7 +17,11 @@ async function boot() {
     onStartRecording: () => runtime.startAudio(),
     onStopRecording: async () => {
       const frames = await runtime.stopAudio();
-      return frames && frames.length ? pcmToWav(frames, 16000) : null;
+      if (!frames || !frames.length) return null;
+      // Frames can be present but empty (capture opened, no samples):
+      // that is no audio, so don't even build the header-only WAV.
+      const totalBytes = frames.reduce((n, f) => n + (f?.length ?? 0), 0);
+      return totalBytes > 0 ? pcmToWav(frames, 16000) : null;
     },
   });
   runtime.setGestureHandler((g) => dispatch(g));

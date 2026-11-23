@@ -1,4 +1,5 @@
 import { truncateLine, wrapText, digestSourceLines } from './format.js';
+import { wavHasAudio } from './wav.js';
 
 export const QUICK_REPLIES = ['Thanks!', 'On it, thanks', 'Will check tonight', 'Sounds good'];
 export const RECORDING_CAP_MS = 30000;
@@ -86,7 +87,9 @@ export function createScreenMachine({ api, now = () => Date.now(), onStartRecord
   async function stopRecording() {
     let wav = null;
     if (onStopRecording) { try { wav = await onStopRecording(); } catch { wav = null; } }
-    if (!wav || wav.length === 0) {
+    // A header-only WAV (44 bytes, zero samples) is no audio at all:
+    // it takes the Mic unavailable path instead of an STT upload.
+    if (!wavHasAudio(wav)) {
       errorLine = 'Mic unavailable'; retryFn = null; state = 'DETAIL'; selected = 0; pageOffset = 0;
       return;
     }

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createScreenMachine, QUICK_REPLIES } from '../src/screens.js';
+import { pcmToWav } from '../src/wav.js';
 
 function fakeApi(overrides = {}) {
   const calls = [];
@@ -125,10 +126,24 @@ test('noFrames hook surfaces Mic unavailable', async () => {
   assert.equal(m._debug().errorLine, 'Mic unavailable');
 });
 
+test('a header-only recording (zero samples) is Mic unavailable, never uploaded', async () => {
+  const api = fakeApi();
+  // pcmToWav of zero frames is the 44-byte RIFF header and nothing else:
+  // exactly what a capture that produced no samples hands back.
+  const m = createScreenMachine({ api, onStartRecording: () => {}, onStopRecording: async () => pcmToWav([]) });
+  await toDetail(m);
+  await m.handleEvent('click'); // Reply by voice
+  assert.equal(m.state, 'RECORDING');
+  await m.handleEvent('click'); // stop
+  assert.equal(m.state, 'DETAIL');
+  assert.equal(m._debug().errorLine, 'Mic unavailable');
+  assert.ok(!api.calls.some((c) => c[0] === 'stt'), 'header-only WAV must not reach STT');
+});
+
 test('recording cap: timeout auto-stops at 30s', async () => {
   let t = 1000;
   const api = fakeApi();
-  const m = createScreenMachine({ api, now: () => t, onStartRecording: () => {}, onStopRecording: async () => new Uint8Array(10) });
+  const m = createScreenMachine({ api, now: () => t, onStartRecording: () => {}, onStopRecording: async () => new Uint8Array(100) });
   await toDetail(m);
   await m.handleEvent('click');
   assert.equal(m.state, 'RECORDING');
@@ -232,7 +247,7 @@ test('DRAFT pages the full draft text before approval', async () => {
 
 test('TRANSCRIPT pages the full text and offers a labelled Discard', async () => {
   const api = fakeApi({ async stt() { return { text: LONG_TEXT }; } });
-  const m = createScreenMachine({ api, onStartRecording: () => {}, onStopRecording: async () => new Uint8Array(10) });
+  const m = createScreenMachine({ api, onStartRecording: () => {}, onStopRecording: async () => new Uint8Array(100) });
   await toDetail(m);
   await m.handleEvent('click'); // start recording
   await m.handleEvent('click'); // stop -> transcript
@@ -266,7 +281,7 @@ test('401 clears the token and returns to PAIRING with the expired line', async 
 test('cap auto-stop swallows the triggering gesture (tap does not send)', async () => {
   let t = 1000;
   const api = fakeApi();
-  const m = createScreenMachine({ api, now: () => t, onStartRecording: () => {}, onStopRecording: async () => new Uint8Array(10) });
+  const m = createScreenMachine({ api, now: () => t, onStartRecording: () => {}, onStopRecording: async () => new Uint8Array(100) });
   await toDetail(m);
   await m.handleEvent('click'); // start recording
   assert.equal(m.state, 'RECORDING');
@@ -297,7 +312,7 @@ test('STT failure from RECORDING reaches the error view and retries', async () =
   const api = fakeApi({
     async stt() { sttAttempts += 1; if (sttAttempts === 1) throw new Error('network'); return { text: 'recovered words' }; },
   });
-  const m = createScreenMachine({ api, onStartRecording: () => {}, onStopRecording: async () => new Uint8Array(10) });
+  const m = createScreenMachine({ api, onStartRecording: () => {}, onStopRecording: async () => new Uint8Array(100) });
   await toDetail(m);
   await m.handleEvent('click'); // start recording
   assert.equal(m.state, 'RECORDING');

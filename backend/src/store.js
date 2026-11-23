@@ -15,7 +15,12 @@
 //   - A source with a null owner belongs to nobody: it is never listed for
 //     any user. Ownership is only ever set when a caller passes an explicit
 //     owner for a brand-new source or fills a still-null owner; an existing
-//     owner is never overwritten.
+//     owner is never overwritten. A still-unowned source can also be
+//     claimed at pairing time: pairing sweeps the unowned sources and
+//     attributes any chat where Telegram reports the pairing user as the
+//     chat's creator or an administrator (recovery for a my_chat_member
+//     update that was missed, e.g. the bot was added while the webhook
+//     was down).
 
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -187,6 +192,13 @@ export class D1Store {
       .bind(chatId, userId ?? null, type ?? null, title ?? null, createdAt)
       .run();
     return this.getSource(chatId);
+  }
+
+  async listUnownedSources() {
+    const { results } = await this.db
+      .prepare(`SELECT * FROM sources WHERE user_id IS NULL`)
+      .all();
+    return results.map(sourceRow);
   }
 
   async deleteSource(sourceId) {
@@ -420,6 +432,14 @@ export class MemoryStore {
     };
     this.sources.set(chatId, source);
     return { ...source };
+  }
+
+  async listUnownedSources() {
+    const out = [];
+    for (const s of this.sources.values()) {
+      if (s.userId == null) out.push({ ...s });
+    }
+    return out;
   }
 
   async deleteSource(sourceId) {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pcmToWav, concatFrames } from '../src/wav.js';
+import { pcmToWav, concatFrames, WAV_HEADER_BYTES, wavHasAudio } from '../src/wav.js';
 
 test('wav header correctness', () => {
   const frame = new Uint8Array(320); // 10ms of silence at 16kHz s16le
@@ -22,9 +22,20 @@ test('wav custom sample rate and empty input', () => {
   const wav = pcmToWav([], 8000);
   assert.equal(wav.length, 44);
   assert.equal(new DataView(wav.buffer).getUint32(24, true), 8000);
-});
-test('concatFrames joins in order', () => {
+});test('concatFrames joins in order', () => {
   assert.deepEqual([...concatFrames([new Uint8Array([1, 2]), new Uint8Array([3])])], [1, 2, 3]);
+});
+test('wavHasAudio rejects header-only and missing WAVs', () => {
+  const headerOnly = pcmToWav([]);
+  assert.equal(headerOnly.length, WAV_HEADER_BYTES);
+  assert.equal(wavHasAudio(headerOnly), false);
+  assert.equal(wavHasAudio(null), false);
+  assert.equal(wavHasAudio(undefined), false);
+  assert.equal(wavHasAudio(new Uint8Array(0)), false);
+  // Frames that are present but empty still produce a header-only WAV.
+  assert.equal(wavHasAudio(pcmToWav([new Uint8Array(0), new Uint8Array(0)])), false);
+  // A single sample (2 bytes of PCM) is audio.
+  assert.equal(wavHasAudio(pcmToWav([new Uint8Array(2)])), true);
 });
 
 import { resampleFloat32 } from '../src/wav.js';

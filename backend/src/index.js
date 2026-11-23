@@ -15,6 +15,10 @@ const DIGEST_LINE_BUDGET = 52;
 const DM_SOURCE_TITLE = "Forwarded & DMs";
 const MAX_STORED_TEXT = 4000;
 const SEND_DEDUPE_WINDOW_MS = 120 * 1000;
+// Upper bound on the unowned-source sweep at pairing time; unowned
+// sources are exceptional (a missed membership update), so a pairing
+// never has real work anywhere near this many.
+const CLAIM_SWEEP_LIMIT = 50;
 
 const FALLBACK_QUESTION = "Thanks for flagging — let me check and get back to you shortly.";
 const FALLBACK_DEFAULT = "Thanks for the update!";
@@ -196,7 +200,53 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
     const token = randomTokenHex();
     const tokenHash = await sha256Hex(token);
     await store.createSession(tokenHash, user.id, nowMs());
+    await claimUnownedSources(user);
     return json({ token, user: { id: user.id, firstName: user.firstName } });
+  }
+
+  async function claimUnownedSources(user) {
+    // Ownership recovery. A group/channel is normally attributed by
+    // my_chat_member to the user who added the bot, but that update can
+    // be missed — the bot added while the webhook was down, a failed
+    // delivery exhausted — leaving the source ownerless: its messages
+    // are stored, yet it appears in no one's digest. Pairing is the one
+    // moment a specific user has just proven who they are, so sweep
+    // then: any still-unowned chat where Telegram reports this user as
+    // the chat's creator or an administrator is attributed to them.
+    // upsertSource only ever fills a null owner, so a claim can never
+    // take a chat from someone else, and a chat nobody claims stays
+    // invisible to everyone. Best effort throughout: a Telegram or
+    // store failure here must never fail the pairing itself.
+    if (!tg || typeof tg.getChatMember !== "function") return;
+    if (typeof store.listUnownedSources !== "function") return;
+    let unowned;
+    try {
+      unowned = await store.listUnownedSources();
+    } catch {
+      return;
+    }
+    for (const source of unowned.slice(0, CLAIM_SWEEP_LIMIT)) {
+      const chatId = source.chatId ?? source.id;
+      let member = null;
+      try {
+        member = await tg.getChatMember(chatId, user.id);
+      } catch {
+        member = null;
+      }
+      if (member && (member.status === "creator" || member.status === "administrator")) {
+        try {
+          await store.upsertSource({
+            chatId,
+            userId: user.id,
+            type: source.type,
+            title: source.title,
+            createdAt: nowMs(),
+          });
+        } catch {
+          // Best effort; the next pairing retries the sweep.
+        }
+      }
+    }
   }
 
   async function handleDigest(req) {

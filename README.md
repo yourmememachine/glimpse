@@ -192,7 +192,11 @@ during the November 23–29, 2026 build window.
   the text as it first arrived; Glimpse does not track later edits.
 - **One operator per chat.** A chat's messages are attached to the
   account whose bot membership surfaced them; this is a personal digest,
-  not a shared team inbox.
+  not a shared team inbox. If that membership update was missed — say
+  the bot was added while the webhook was down — the chat waits
+  ownerless, visible to no one, and pairing again claims any
+  still-unowned chat where Telegram lists you as its creator or an
+  administrator.
 - **Telegram privacy mode.** With privacy mode on, the bot only sees
   commands, mentions, and replies to it in groups — the digest reflects
   exactly what Telegram sends, nothing more.
