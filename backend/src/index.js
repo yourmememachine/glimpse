@@ -15,10 +15,17 @@ const SEND_DEDUPE_WINDOW_MS = 120 * 1000;
 const FALLBACK_QUESTION = "Thanks for flagging — let me check and get back to you shortly.";
 const FALLBACK_DEFAULT = "Thanks for the update!";
 
+const CORS_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "authorization, content-type",
+  "access-control-max-age": "86400",
+};
+
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...CORS_HEADERS },
   });
 }
 
@@ -459,6 +466,10 @@ export function createApp({ store, tg, ai, now, webhookSecret } = {}) {
       const url = new URL(req.url);
       const path = url.pathname.replace(/\/+$/, "") || "/";
       const method = req.method.toUpperCase();
+
+      if (method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: CORS_HEADERS });
+      }
 
       if (method === "POST" && path.startsWith("/v1/")) {
         const lengthHeader = req.headers.get("content-length");
